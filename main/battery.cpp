@@ -1,5 +1,6 @@
 #include "battery.hpp"
 
+#include <atomic>
 #include <mutex>
 
 #include "freertos/FreeRTOS.h"
@@ -24,11 +25,25 @@ constexpr uint8_t kRegGaugeCtrl = 0x18;   // bit3: fuel gauge enable
 constexpr uint8_t kRegAdcCtrl = 0x30;     // bit0: battery voltage ADC, bit1: TS pin ADC
 constexpr uint8_t kRegBatDetCtrl = 0x68;  // bit0: battery detection enable
 constexpr uint8_t kRegBatPercent = 0xA4;
-constexpr uint32_t kPollMs = 2000;
+constexpr uint8_t kRegCommonCfg = 0x10;  // bit0: soft power off
+constexpr uint8_t kRegIrqLevel = 0x27;   // bits[5:4]: PWR long-press IRQ time (2 = 2 s)
+constexpr uint8_t kRegIntEn2 = 0x41;     // bits[3:0]: PWR key IRQ enables
+constexpr uint8_t kRegIntSts2 = 0x49;    // bits[3:0]: PWR key IRQ status, write 1 to clear
+constexpr uint8_t kKeyBits = slm::PKEY_RELEASE | slm::PKEY_PRESS | slm::PKEY_LONG | slm::PKEY_SHORT;
+constexpr uint32_t kKeyPollMs = 50;
+constexpr uint32_t kBatteryPollMs = 2000;
+constexpr uint32_t kPowerOffMessageMs = 800;  // time to show "Powering off" first
 
 i2c_master_dev_handle_t s_pmu = nullptr;
 std::mutex s_mutex;
 slm::BatteryStatus s_status;
+std::atomic<slm::PowerKey> s_key{slm::PowerKey::Idle};
+
+esp_err_t pmu_write(uint8_t reg, uint8_t value)
+{
+    const uint8_t buf[2] = {reg, value};
+    return i2c_master_transmit(s_pmu, buf, sizeof(buf), 50);
+}
 
 esp_err_t pmu_read(uint8_t reg, uint8_t &value)
 {
@@ -42,8 +57,7 @@ esp_err_t pmu_update_bits(uint8_t reg, uint8_t set, uint8_t clear)
     if (err != ESP_OK) return err;
     const uint8_t nv = (v | set) & ~clear;
     if (nv == v) return ESP_OK;
-    const uint8_t buf[2] = {reg, nv};
-    return i2c_master_transmit(s_pmu, buf, sizeof(buf), 50);
+    return pmu_write(reg, nv);
 }
 
 bool pmu_init()
@@ -66,34 +80,72 @@ bool pmu_init()
     bool ok = pmu_update_bits(kRegBatDetCtrl, 0x01, 0) == ESP_OK;
     ok &= pmu_update_bits(kRegGaugeCtrl, 0x08, 0) == ESP_OK;
     ok &= pmu_update_bits(kRegAdcCtrl, 0x01, 0x02) == ESP_OK;
+    // PWR key: long-press IRQ after 2 s, key IRQs enabled, stale events cleared.
+    ok &= pmu_update_bits(kRegIrqLevel, 0x20, 0x10) == ESP_OK;
+    ok &= pmu_update_bits(kRegIntEn2, kKeyBits, 0) == ESP_OK;
+    ok &= pmu_write(kRegIntSts2, kKeyBits) == ESP_OK;
     if (!ok) ESP_LOGW(TAG, "AXP2101 configuration incomplete");
     return true;
 }
 
-void battery_task(void *)
+void power_off()
+{
+    ESP_LOGI(TAG, "PWR held: powering off");
+    vTaskDelay(pdMS_TO_TICKS(kPowerOffMessageMs));
+    pmu_update_bits(kRegCommonCfg, 0x01, 0);
+    // The PMU cuts power almost immediately; nothing more to do.
+    while (true) vTaskDelay(portMAX_DELAY);
+}
+
+void poll_power_key(slm::PowerKeyTracker &tracker)
+{
+    uint8_t sts;
+    if (pmu_read(kRegIntSts2, sts) != ESP_OK) return;
+    sts &= kKeyBits;
+    if (sts == 0) return;
+    pmu_write(kRegIntSts2, sts);  // clear the events we are handling
+    const slm::PowerKey k = tracker.update(sts);
+    s_key = k;
+    if (k == slm::PowerKey::PowerOff) power_off();
+}
+
+void poll_battery()
+{
+    uint8_t s1, s2, pct;
+    if (pmu_read(kRegStatus1, s1) != ESP_OK || pmu_read(kRegStatus2, s2) != ESP_OK ||
+        pmu_read(kRegBatPercent, pct) != ESP_OK) {
+        return;
+    }
+    const slm::BatteryStatus st = slm::decode_axp2101(s1, s2, pct);
+    bool changed;
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        changed = !s_status.valid || st.present != s_status.present || st.charging != s_status.charging ||
+                  st.percent != s_status.percent;
+        s_status = st;
+    }
+    if (changed) {
+        ESP_LOGI(TAG, "battery %s, %d %%, %s, USB %s", st.present ? "present" : "absent", st.percent,
+                 st.charging ? "charging" : "not charging", st.usb_power ? "yes" : "no");
+    }
+}
+
+void pmu_task(void *)
 {
     if (!pmu_init()) {
         vTaskDelete(nullptr);
         return;
     }
+    slm::PowerKeyTracker tracker;
+    uint32_t since_battery = kBatteryPollMs;  // read the battery straight away
     while (true) {
-        uint8_t s1, s2, pct;
-        if (pmu_read(kRegStatus1, s1) == ESP_OK && pmu_read(kRegStatus2, s2) == ESP_OK &&
-            pmu_read(kRegBatPercent, pct) == ESP_OK) {
-            const slm::BatteryStatus st = slm::decode_axp2101(s1, s2, pct);
-            bool changed;
-            {
-                std::lock_guard<std::mutex> lock(s_mutex);
-                changed = !s_status.valid || st.present != s_status.present ||
-                          st.charging != s_status.charging || st.percent != s_status.percent;
-                s_status = st;
-            }
-            if (changed) {
-                ESP_LOGI(TAG, "battery %s, %d %%, %s, USB %s", st.present ? "present" : "absent", st.percent,
-                         st.charging ? "charging" : "not charging", st.usb_power ? "yes" : "no");
-            }
+        poll_power_key(tracker);
+        if (since_battery >= kBatteryPollMs) {
+            since_battery = 0;
+            poll_battery();
         }
-        vTaskDelay(pdMS_TO_TICKS(kPollMs));
+        vTaskDelay(pdMS_TO_TICKS(kKeyPollMs));
+        since_battery += kKeyPollMs;
     }
 }
 
@@ -204,8 +256,10 @@ void icon_delete_cb(lv_event_t *e) { delete static_cast<IconState *>(lv_event_ge
 
 void battery_start()
 {
-    xTaskCreatePinnedToCore(battery_task, "battery", 3 * 1024, nullptr, 2, nullptr, 0);
+    xTaskCreatePinnedToCore(pmu_task, "pmu", 3 * 1024, nullptr, 3, nullptr, 0);
 }
+
+slm::PowerKey power_key_get() { return s_key; }
 
 slm::BatteryStatus battery_get()
 {

@@ -312,6 +312,26 @@ static int check_battery()
     check("fill 1% shows a sliver", slm::battery_fill_width(1, 34) == 1);
     check("fill 50%", slm::battery_fill_width(50, 34) == 17);
     check("fill 100%", slm::battery_fill_width(100, 34) == 34);
+    // PWR key hold-to-power-off.
+    using slm::PowerKey;
+    {
+        slm::PowerKeyTracker k;
+        check("long press still held from power-on is ignored", k.update(slm::PKEY_LONG) == PowerKey::Idle);
+        check("release after power-on hold", k.update(slm::PKEY_RELEASE) == PowerKey::Idle);
+        check("press -> held", k.update(slm::PKEY_PRESS) == PowerKey::Held);
+        check("still held, no events", k.update(0) == PowerKey::Held);
+        check("long press after seen press -> power off", k.update(slm::PKEY_LONG) == PowerKey::PowerOff);
+        check("power off is final", k.update(slm::PKEY_RELEASE) == PowerKey::PowerOff);
+    }
+    {
+        slm::PowerKeyTracker k;
+        k.update(slm::PKEY_PRESS);
+        check("early release -> idle", k.update(slm::PKEY_RELEASE | slm::PKEY_SHORT) == PowerKey::Idle);
+        check("long after release is ignored", k.update(slm::PKEY_LONG) == PowerKey::Idle);
+        check("tap within one poll -> idle", k.update(slm::PKEY_PRESS | slm::PKEY_RELEASE) == PowerKey::Idle);
+        check("press+long in one poll -> power off",
+              k.update(slm::PKEY_PRESS | slm::PKEY_LONG) == PowerKey::PowerOff);
+    }
     std::printf("battery: %s\n", fails ? "FAILED" : "ok");
     return fails;
 }

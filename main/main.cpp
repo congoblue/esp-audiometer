@@ -161,6 +161,9 @@ struct Ui {
     lv_obj_t *cal_value;
     lv_obj_t *cal_live;
     lv_obj_t *battery;
+    lv_obj_t *power_overlay;
+    lv_obj_t *power_label;
+    slm::PowerKey shown_key = slm::PowerKey::Idle;
     bool slow = false;
     float cal_backup = 0;
 } ui;
@@ -209,6 +212,21 @@ void update_cal_label()
     lv_label_set_text(ui.cal_value, buf);
 }
 
+// Full-screen message while the PWR key is held, on the top layer so it also
+// covers the calibration page.
+void update_power_overlay()
+{
+    const slm::PowerKey k = power_key_get();
+    if (k == ui.shown_key) return;
+    ui.shown_key = k;
+    if (k == slm::PowerKey::Idle) {
+        lv_obj_add_flag(ui.power_overlay, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_label_set_text(ui.power_label, k == slm::PowerKey::Held ? "Hold to power off" : "Powering off");
+    lv_obj_remove_flag(ui.power_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
 void ui_timer_cb(lv_timer_t *)
 {
     slm::Levels l;
@@ -217,6 +235,7 @@ void ui_timer_cb(lv_timer_t *)
         l = g_levels;
     }
     battery_icon_set(ui.battery, battery_get());  // redraws only on change
+    update_power_overlay();
 
     if (!g_audio_ok) {
         seg7_set_text(ui.value, "i--.-");
@@ -422,9 +441,20 @@ void build_ui()
     // (opacity over the black background = brightness).
     ui.battery = battery_icon_create(scr);
     lv_obj_align(ui.battery, LV_ALIGN_BOTTOM_MID, 0, -18);
-    lv_obj_set_style_opa(ui.battery, 84, 0);  // 84 / 255 = 33 %
+    // 84 / 255 = 33 %. Must be opa_layered: plain `opa` is only applied by
+    // LVGL's built-in widgets, not by this icon's custom drawing.
+    lv_obj_set_style_opa_layered(ui.battery, 84, 0);
 
     build_cal_panel(scr);
+
+    ui.power_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(ui.power_overlay);
+    lv_obj_set_size(ui.power_overlay, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_set_style_bg_color(ui.power_overlay, kColBg, 0);
+    lv_obj_set_style_bg_opa(ui.power_overlay, LV_OPA_COVER, 0);
+    ui.power_label = make_label(ui.power_overlay, &lv_font_montserrat_24, kColText, "");
+    lv_obj_center(ui.power_label);
+    lv_obj_add_flag(ui.power_overlay, LV_OBJ_FLAG_HIDDEN);
 
     lv_timer_create(ui_timer_cb, 100, nullptr);
 }

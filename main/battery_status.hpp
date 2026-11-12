@@ -52,4 +52,43 @@ inline int32_t battery_fill_width(int percent, int32_t inner_w)
     return w < 1 ? 1 : w;
 }
 
+// ---------------------------------------------------------------------------
+// PWR key (AXP2101 PWRON) -> hold-to-power-off.
+//
+// IRQ status register 0x49 bits (XPowersLib):
+//   bit0 positive edge (key released)   bit1 negative edge (key pressed)
+//   bit2 long press (held for the 0x27 IRQ time, set to 2 s)
+//   bit3 short press
+// ---------------------------------------------------------------------------
+enum : uint8_t { PKEY_RELEASE = 0x01, PKEY_PRESS = 0x02, PKEY_LONG = 0x04, PKEY_SHORT = 0x08 };
+
+enum class PowerKey { Idle, Held, PowerOff };
+
+// A long press only counts if the press itself was seen after start-up, so
+// keeping PWR held after switching the meter on does not switch it off again.
+class PowerKeyTracker {
+public:
+    PowerKey update(uint8_t irq_status)
+    {
+        if (state_ == PowerKey::PowerOff) return state_;
+        if (irq_status & PKEY_PRESS) armed_ = true;
+        if ((irq_status & PKEY_LONG) && armed_) {
+            state_ = PowerKey::PowerOff;
+        } else if (irq_status & PKEY_RELEASE) {
+            // A press and release in the same poll is a tap: back to idle.
+            armed_ = false;
+            state_ = PowerKey::Idle;
+        } else if (irq_status & PKEY_PRESS) {
+            state_ = PowerKey::Held;
+        }
+        return state_;
+    }
+
+    PowerKey state() const { return state_; }
+
+private:
+    bool armed_ = false;
+    PowerKey state_ = PowerKey::Idle;
+};
+
 }  // namespace slm
