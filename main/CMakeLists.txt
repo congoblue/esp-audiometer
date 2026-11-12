@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.cpp" "auto_rotate.cpp" "seg7_widget.cpp"
+    SRCS "main.cpp" "auto_rotate.cpp" "seg7_widget.cpp" "battery.cpp"
     INCLUDE_DIRS ".")
 
 # With CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM, LVGL 9 puts IRAM_ATTR on both the

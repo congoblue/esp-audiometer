@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "a_weighting.hpp"
+#include "battery_status.hpp"
 #include "level_meter.hpp"
 #include "orientation.hpp"
 #include "seg7_layout.hpp"
@@ -278,9 +279,47 @@ static int check_seg7()
     return fails;
 }
 
+// Battery: AXP2101 register decoding, colour thresholds and fill width.
+static int check_battery()
+{
+    int fails = 0;
+    auto check = [&](const char *what, bool ok) {
+        if (!ok) {
+            std::printf("battery: %s  << FAIL\n", what);
+            ++fails;
+        }
+    };
+    using slm::BatteryLevel;
+    // STATUS1 bit3 = battery, bit5 = VBUS; STATUS2 bits[7:5] = 001 charging.
+    auto s = slm::decode_axp2101(0x28, 0x20, 57);
+    check("present+charging", s.valid && s.present && s.charging && s.usb_power && s.percent == 57);
+    s = slm::decode_axp2101(0x08, 0x40, 80);
+    check("discharging", s.present && !s.charging && !s.usb_power);
+    s = slm::decode_axp2101(0x20, 0x20, 0);
+    check("no battery is never 'charging'", !s.present && !s.charging && s.usb_power);
+    s = slm::decode_axp2101(0x08, 0x00, 0xFF);
+    check("gauge value clamped to 100", s.percent == 100);
+    s = slm::decode_axp2101(0x08, 0xA0, 50);  // bits[7:5] = 101: not charging
+    check("only 001 counts as charging", !s.charging);
+
+    check("21% green", slm::battery_level(21) == BatteryLevel::Ok);
+    check("20% yellow", slm::battery_level(20) == BatteryLevel::Low);
+    check("10% yellow", slm::battery_level(10) == BatteryLevel::Low);
+    check("9% red", slm::battery_level(9) == BatteryLevel::Critical);
+    check("0% red", slm::battery_level(0) == BatteryLevel::Critical);
+
+    check("fill 0%", slm::battery_fill_width(0, 34) == 0);
+    check("fill 1% shows a sliver", slm::battery_fill_width(1, 34) == 1);
+    check("fill 50%", slm::battery_fill_width(50, 34) == 17);
+    check("fill 100%", slm::battery_fill_width(100, 34) == 34);
+    std::printf("battery: %s\n", fails ? "FAILED" : "ok");
+    return fails;
+}
+
 int main()
 {
     int failures = 0;
+    failures += check_battery();
     failures += check_seg7();
     failures += check_orientation();
     failures += check_response(48000);

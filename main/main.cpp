@@ -26,6 +26,7 @@
 #include "auto_rotate.hpp"
 #include "level_meter.hpp"
 #include "seg7_widget.hpp"
+#include "battery.hpp"
 
 namespace {
 
@@ -159,6 +160,7 @@ struct Ui {
     lv_obj_t *cal_panel;
     lv_obj_t *cal_value;
     lv_obj_t *cal_live;
+    lv_obj_t *battery;
     bool slow = false;
     float cal_backup = 0;
 } ui;
@@ -214,6 +216,8 @@ void ui_timer_cb(lv_timer_t *)
         std::lock_guard<std::mutex> lock(g_levels_mutex);
         l = g_levels;
     }
+    battery_icon_set(ui.battery, battery_get());  // redraws only on change
+
     if (!g_audio_ok) {
         seg7_set_text(ui.value, "i--.-");
         lv_label_set_text(ui.stats, "Microphone not available");
@@ -414,6 +418,12 @@ void build_ui()
     lv_obj_t *cal = make_button(scr, "Cal", 120, 52, on_cal_open, nullptr);
     lv_obj_align(cal, LV_ALIGN_CENTER, 66, 160);
 
+    // Battery icon, bottom centre in the gap of the arc, dimmed to 33 %
+    // (opacity over the black background = brightness).
+    ui.battery = battery_icon_create(scr);
+    lv_obj_align(ui.battery, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_obj_set_style_opa(ui.battery, 84, 0);  // 84 / 255 = 33 %
+
     build_cal_panel(scr);
 
     lv_timer_create(ui_timer_cb, 100, nullptr);
@@ -446,4 +456,5 @@ extern "C" void app_main(void)
 
     // Audio on core 1 at high priority so I2S never overruns while LVGL renders.
     xTaskCreatePinnedToCore(audio_task, "audio", 6 * 1024, nullptr, 10, nullptr, 1);
+    battery_start();
 }
