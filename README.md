@@ -63,6 +63,29 @@ Settings are under `idf.py menuconfig` → **Sound Level Meter**:
 | `SLM_MIC_GAIN_DB` | 12 | ES7210 PGA gain. Lower it for very loud sources, raise it for quiet rooms. Calibration is stored relative to 0 dB gain, so you do not need to recalibrate after changing it. |
 | `SLM_CAL_OFFSET_X10` | 1350 | Default offset of 135.0 dB, used until you save a calibration on the device. |
 
+## Auto-rotation
+
+The QMI8658 accelerometer works out which edge of the board is pointing up,
+and the display turns in 90° steps to match ([main/auto_rotate.cpp](main/auto_rotate.cpp)).
+
+- The display controller does the rotation (CO5300 MADCTL), so it costs no
+  CPU. Touch coordinates are rotated in software to match.
+- The screen only turns once the board has been held in the new position for
+  0.4 s, and there is a ±15° dead band between positions.
+- Lying flat on a table, the screen keeps its current orientation.
+
+If an orientation comes out wrong, use **menuconfig → Sound Level Meter →
+Auto-rotation**:
+
+| Symptom | Fix |
+|---|---|
+| Wrong by the same angle in every position | `SLM_IMU_ROTATION_OFFSET`, in quarter turns clockwise. The default is 3 (90° anticlockwise). |
+| On its side the picture is upside down, but taps hit what's drawn | `SLM_IMU_MIRROR` |
+| On its side the picture is upside down, and taps hit the opposite button | `SLM_PANEL_SWAP_90_270` |
+
+Set the log level for the `rotate` tag to Debug to see the raw accelerometer
+readings.
+
 ## Calibration
 
 The default offset is only an estimate. It assumes a −38 dBV/Pa MEMS capsule.

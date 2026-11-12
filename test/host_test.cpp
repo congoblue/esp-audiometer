@@ -16,6 +16,7 @@
 
 #include "a_weighting.hpp"
 #include "level_meter.hpp"
+#include "orientation.hpp"
 
 struct Tol { double f, plus, minus; };
 
@@ -117,9 +118,77 @@ static int check_time_weighting(double fs)
     return fails;
 }
 
+// Orientation detector: hold time, dead band, flat-on-table behaviour, and
+// touch remapping that is the inverse of the display rotation.
+static int check_orientation()
+{
+    int fails = 0;
+    auto expect = [&](const char *what, int got, int want) {
+        const bool ok = got == want;
+        std::printf("orientation: %-44s -> %d (want %d)%s\n", what, got, want, ok ? "" : "  << FAIL");
+        fails += !ok;
+    };
+    auto feed = [](slm::OrientationDetector &d, float deg, float g, int ms) {
+        const float r = deg * float(M_PI) / 180.0f;
+        int o = d.orientation();
+        for (int t = 0; t < ms; t += 50) o = d.update(g * std::sin(r), g * std::cos(r), 50);
+        return o;
+    };
+
+    slm::OrientationDetector d;
+    expect("upright", feed(d, 0, 1.0f, 1000), 0);
+    expect("right edge up, only 200 ms (debounce)", feed(d, 90, 1.0f, 200), 0);
+    expect("right edge up, held", feed(d, 90, 1.0f, 600), 1);
+    expect("bottom edge up", feed(d, 180, 1.0f, 1000), 2);
+    expect("left edge up", feed(d, 270, 1.0f, 1000), 3);
+    expect("45 deg between left and top (dead band)", feed(d, 315, 1.0f, 1000), 3);
+    expect("25 deg from top (inside capture)", feed(d, 335, 1.0f, 1000), 0);
+    expect("flat on table, tilt 0.2 g towards right", feed(d, 90, 0.2f, 2000), 0);
+    expect("brief wobble to 90 then back", (feed(d, 90, 1.0f, 300), feed(d, 0, 1.0f, 600)), 0);
+
+    // Power-up: nearest orientation immediately, normal (0) when flat.
+    auto at = [](float deg, float g) {
+        const float r = deg * float(M_PI) / 180.0f;
+        return slm::OrientationDetector::initial(g * std::sin(r), g * std::cos(r));
+    };
+    expect("power-up upright", at(0, 1.0f), 0);
+    expect("power-up right edge up", at(90, 1.0f), 1);
+    expect("power-up upside down", at(180, 1.0f), 2);
+    expect("power-up left edge up, tilted 40 deg off", at(310, 1.0f), 3);
+    expect("power-up flat (0.1 g in plane)", at(90, 0.1f), 0);
+    slm::OrientationDetector d2(at(180, 1.0f));
+    expect("detector seeded upside down stays there", feed(d2, 180, 1.0f, 1000), 2);
+
+    // Touch: for every rotation, the physical point where a logical point is
+    // drawn must map back to that logical point.
+    const int32_t n = 479;
+    for (int q = 0; q < 4; ++q) {
+        for (int32_t lx : {0, 10, 240, 479}) {
+            for (int32_t ly : {0, 33, 400, 479}) {
+                int32_t px, py;  // logical -> physical for a clockwise rotation
+                switch (q) {
+                case 1: px = n - ly; py = lx; break;
+                case 2: px = n - lx; py = n - ly; break;
+                case 3: px = ly; py = n - lx; break;
+                default: px = lx; py = ly; break;
+                }
+                int32_t x = px, y = py;
+                slm::rotate_touch_point(q, n, x, y);
+                if (x != lx || y != ly) {
+                    std::printf("touch q=%d (%d,%d) -> (%d,%d)  << FAIL\n", q, lx, ly, x, y);
+                    ++fails;
+                }
+            }
+        }
+    }
+    std::printf("touch remap round-trip: %s\n", fails ? "see failures" : "ok");
+    return fails;
+}
+
 int main()
 {
     int failures = 0;
+    failures += check_orientation();
     failures += check_response(48000);
     failures += check_response(44100);
     std::printf("\n");

@@ -20,4 +20,43 @@ menu "Sound Level Meter"
             against a reference meter or 94 dB calibrator using the on-screen
             Cal page, which saves the result to NVS and overrides this value.
 
+    menu "Auto-rotation"
+
+        config SLM_AUTO_ROTATE
+            bool "Rotate the display to follow the device (QMI8658 IMU)"
+            default y
+
+        config SLM_IMU_ROTATION_OFFSET
+            int "Orientation offset (quarter turns clockwise)"
+            depends on SLM_AUTO_ROTATE
+            range 0 3
+            default 3
+            help
+                Added to the detected orientation. 3 (= 90 degrees
+                anticlockwise) is the default orientation for this device.
+                It is also used when the board is lying flat at power-up or
+                the IMU is not found. Change this if the display is always
+                off by the same angle.
+
+        config SLM_IMU_MIRROR
+            bool "Mirror IMU X axis"
+            depends on SLM_AUTO_ROTATE
+            default n
+            help
+                Enable if upright and upside-down work, but on either side the
+                picture is upside down AND the buttons still respond where
+                they are drawn. (The IMU picked the wrong side.)
+
+        config SLM_PANEL_SWAP_90_270
+            bool "Swap panel 90/270 rotation"
+            depends on SLM_AUTO_ROTATE
+            default n
+            help
+                Enable if upright and upside-down work, but on either side the
+                picture is upside down AND tapping a button triggers the one
+                drawn opposite it. (The panel rotates the opposite way to the
+                BSP's MADCTL table.)
+
+    endmenu
+
 endmenu

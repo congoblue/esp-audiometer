@@ -11,5 +11,7 @@
       "--background-index",
       "--query-driver=**",
       "--compile-commands-dir=c:\\Users\\Boardroom\\Documents\\GitHub\\esp-audiometer\\build"
-    ]
+    ],
+    "idf.flashType": "UART",
+    "idf.port": "COM7"
 }

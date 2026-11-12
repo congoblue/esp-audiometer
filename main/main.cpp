@@ -23,6 +23,7 @@
 #include "esp_codec_dev.h"
 #include "lvgl.h"
 
+#include "auto_rotate.hpp"
 #include "level_meter.hpp"
 
 namespace {
@@ -360,10 +361,10 @@ void build_ui()
     lv_obj_set_style_arc_color(ui.arc, kColTrack, LV_PART_MAIN);
     lv_obj_set_style_arc_color(ui.arc, kColGreen, LV_PART_INDICATOR);
 
-    lv_obj_t *lo = make_label(scr, &lv_font_montserrat_16, kColDim, "30");
-    lv_obj_align(lo, LV_ALIGN_CENTER, -118, 172);
+    /*lv_obj_t *lo = make_label(scr, &lv_font_montserrat_16, kColDim, "30");
+    lv_obj_align(lo, LV_ALIGN_CENTER, -140, 172);
     lv_obj_t *hi = make_label(scr, &lv_font_montserrat_16, kColDim, "130");
-    lv_obj_align(hi, LV_ALIGN_CENTER, 118, 172);
+    lv_obj_align(hi, LV_ALIGN_CENTER, 140, 172);*/
 
     ui.over = make_label(scr, &lv_font_montserrat_24, kColRed, "OVERLOAD");
     lv_obj_align(ui.over, LV_ALIGN_CENTER, 0, -130);
@@ -371,7 +372,7 @@ void build_ui()
 
     // Big reading; tap it to switch Fast / Slow.
     ui.value = make_label(scr, &lv_font_montserrat_48, kColText, "--.-");
-    lv_obj_set_style_transform_scale(ui.value, 400, 0);  // 1.56x
+    lv_obj_set_style_transform_scale(ui.value, 600, 0);  // 1.56x
     lv_obj_set_style_transform_pivot_x(ui.value, LV_PCT(50), 0);
     lv_obj_set_style_transform_pivot_y(ui.value, LV_PCT(50), 0);
     lv_obj_align(ui.value, LV_ALIGN_CENTER, 0, -55);
@@ -420,6 +421,9 @@ extern "C" void app_main(void)
         bsp_display_backlight_on();
         bsp_display_lock(UINT32_MAX);
         build_ui();
+#if CONFIG_SLM_AUTO_ROTATE
+        auto_rotate_start();
+#endif
         bsp_display_unlock();
     }
 
