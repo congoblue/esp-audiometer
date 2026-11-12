@@ -80,6 +80,7 @@ Auto-rotation**:
 | Symptom | Fix |
 |---|---|
 | Wrong by the same angle in every position | `SLM_IMU_ROTATION_OFFSET`, in quarter turns clockwise. The default is 3 (90° anticlockwise). |
+| Taps register a quarter or half turn away from the button, the same in every orientation | `SLM_TOUCH_ROTATION_OFFSET`. The default is 1; try 3 if that is worse. |
 | On its side the picture is upside down, but taps hit what's drawn | `SLM_IMU_MIRROR` |
 | On its side the picture is upside down, and taps hit the opposite button | `SLM_PANEL_SWAP_90_270` |
 

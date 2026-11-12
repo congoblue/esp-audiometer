@@ -40,6 +40,11 @@ constexpr float kLsbPerG = 16384.0f;  // +/-2 g range
 
 constexpr uint32_t kPollMs = 50;
 
+// Fallback in case sdkconfig was generated before this option existed.
+#ifndef CONFIG_SLM_TOUCH_ROTATION_OFFSET
+#define CONFIG_SLM_TOUCH_ROTATION_OFFSET 1
+#endif
+
 i2c_master_dev_handle_t s_imu = nullptr;
 std::atomic<int> s_target{0};  // wanted orientation, written by the IMU task
 int s_applied = 0;             // only touched in the LVGL task
@@ -164,7 +169,9 @@ void apply_rotation_cb(lv_timer_t *)
 void rotated_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     s_orig_read_cb(indev, data);
-    slm::rotate_touch_point(s_applied, BSP_LCD_H_RES - 1, data->point.x, data->point.y);
+    // Rotations compose, so the fixed touch correction simply adds on.
+    slm::rotate_touch_point((s_applied + CONFIG_SLM_TOUCH_ROTATION_OFFSET) & 3, BSP_LCD_H_RES - 1,
+                            data->point.x, data->point.y);
 }
 
 }  // namespace

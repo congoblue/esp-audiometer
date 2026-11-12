@@ -38,6 +38,19 @@ menu "Sound Level Meter"
                 the IMU is not found. Change this if the display is always
                 off by the same angle.
 
+        config SLM_TOUCH_ROTATION_OFFSET
+            int "Touch correction (quarter turns clockwise)"
+            depends on SLM_AUTO_ROTATE
+            range 0 3
+            default 1
+            help
+                Rotates touch points relative to the picture. Use this when
+                taps register a quarter or half turn away from where the
+                button is drawn, by the same amount in every orientation.
+                1 corrects touch that is rotated 90 degrees anticlockwise
+                from the picture (tapping the top of the screen acts on the
+                right). If that makes it worse, use 3.
+
         config SLM_IMU_MIRROR
             bool "Mirror IMU X axis"
             depends on SLM_AUTO_ROTATE

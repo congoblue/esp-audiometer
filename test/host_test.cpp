@@ -17,6 +17,9 @@
 #include "a_weighting.hpp"
 #include "level_meter.hpp"
 #include "orientation.hpp"
+#include "seg7_layout.hpp"
+
+#include <string>
 
 struct Tol { double f, plus, minus; };
 
@@ -185,9 +188,100 @@ static int check_orientation()
     return fails;
 }
 
+// Seven-segment layout: segment counts, fixed width, no overlaps, in bounds,
+// plus an ASCII preview of the digit shapes.
+static int check_seg7()
+{
+    int fails = 0;
+    slm::Seg7Geometry g;  // the geometry used on the device
+
+    const int expect_lit[10] = {6, 2, 5, 5, 4, 5, 6, 3, 7, 6};
+    for (int d = 0; d < 10; ++d) {
+        const char s[2] = {char('0' + d), 0};
+        int lit = 0, total = 0;
+        slm::seg7_layout(s, g, [&](const slm::Seg7Segment &r) { lit += r.lit; ++total; });
+        if (lit != expect_lit[d] || total != 7) {
+            std::printf("seg7 '%c': %d lit of %d  << FAIL\n", s[0], lit, total);
+            ++fails;
+        }
+    }
+
+    // Narrow hundreds cell: two segments, lit for 'I', unlit for 'i'.
+    for (const char *s : {"I", "i"}) {
+        int lit = 0, total = 0;
+        slm::seg7_layout(s, g, [&](const slm::Seg7Segment &r) { lit += r.lit; ++total; });
+        const int want_lit = s[0] == 'I' ? 2 : 0;
+        if (lit != want_lit || total != 2 || slm::seg7_width(s, g) != g.thick) {
+            std::printf("seg7 '%s': %d lit of %d, width %d  << FAIL\n", s, lit, total, slm::seg7_width(s, g));
+            ++fails;
+        }
+    }
+
+    // Fixed-width formatting keeps the width constant (main.cpp's fmt_seg7).
+    const char *samples[] = {"I88.8", "i54.3", "I05.2", "i--.-", "i 0.0"};
+    const int32_t w0 = slm::seg7_width(samples[0], g);
+    for (const char *s : samples) {
+        if (slm::seg7_width(s, g) != w0) {
+            std::printf("seg7 width of \"%s\" differs  << FAIL\n", s);
+            ++fails;
+        }
+    }
+
+    // Rasterise "888.8": every pixel belongs to at most one segment, nothing
+    // falls outside the widget, and each bar reaches its full thickness.
+    std::vector<slm::Seg7Segment> segs;
+    const int32_t w = slm::seg7_layout("I88.8", g, [&](const slm::Seg7Segment &r) { segs.push_back(r); });
+    std::vector<int> owner(size_t(w) * g.digit_h, -1);
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const auto &s = segs[i];
+        if (s.x1 < 0 || s.y1 < 0 || s.x2 > w || s.y2 > g.digit_h || s.x1 >= s.x2 || s.y1 >= s.y2) {
+            std::printf("seg7 segment %zu out of bounds  << FAIL\n", i);
+            ++fails;
+            continue;
+        }
+        int width_max = 0;
+        for (int32_t y = s.y1; y < s.y2; ++y) {
+            int row = 0;
+            for (int32_t x = s.x1; x < s.x2; ++x) {
+                if (!slm::seg7_contains(s, x, y)) continue;
+                ++row;
+                int &o = owner[size_t(y) * w + x];
+                if (o >= 0) {
+                    std::printf("seg7 segments %d and %zu overlap at (%d,%d)  << FAIL\n", o, i, x, y);
+                    ++fails;
+                }
+                o = int(i);
+            }
+            width_max = row > width_max ? row : width_max;
+        }
+        if (s.shape == slm::Seg7Shape::Vertical && width_max != g.thick) {
+            std::printf("seg7 segment %zu max thickness %d, want %d  << FAIL\n", i, width_max, g.thick);
+            ++fails;
+        }
+    }
+    std::printf("\nseg7: \"I88.8\" is %d x %d px (\"888.8\" would be %d), %zu segments, %s\n", w, g.digit_h,
+                slm::seg7_width("888.8", g), segs.size(), fails ? "FAILED" : "ok");
+
+    // ASCII preview at reduced size: '#' lit, '.' unlit.
+    slm::Seg7Geometry s;
+    s.digit_w = 16; s.digit_h = 25; s.thick = 4; s.gap = 1; s.spacing = 4; s.dp_w = 4; s.dp_spacing = 2;
+    const char *txt = "I05.2";
+    const int32_t pw = slm::seg7_width(txt, s);
+    std::vector<std::string> canvas(s.digit_h, std::string(pw, ' '));
+    slm::seg7_layout(txt, s, [&](const slm::Seg7Segment &r) {
+        for (int32_t y = r.y1; y < r.y2; ++y)
+            for (int32_t x = r.x1; x < r.x2; ++x)
+                if (slm::seg7_contains(r, x, y)) canvas[y][x] = r.lit ? '#' : '.';
+    });
+    std::printf("preview \"%s\":\n", txt);
+    for (const auto &row : canvas) std::printf("  %s\n", row.c_str());
+    return fails;
+}
+
 int main()
 {
     int failures = 0;
+    failures += check_seg7();
     failures += check_orientation();
     failures += check_response(48000);
     failures += check_response(44100);

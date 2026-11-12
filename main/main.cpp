@@ -25,6 +25,7 @@
 
 #include "auto_rotate.hpp"
 #include "level_meter.hpp"
+#include "seg7_widget.hpp"
 
 namespace {
 
@@ -184,6 +185,21 @@ void fmt_db(char *buf, size_t n, float spl)
     else snprintf(buf, n, "%.1f", spl);
 }
 
+// Main reading for the seven-segment display. The hundreds place is a narrow
+// "1"-only cell ('I' lit, 'i' unlit), then "DD.D", so the digits never shift:
+//   54.3 -> "i54.3"   105.2 -> "I05.2"   no reading -> "i--.-"
+void fmt_seg7(char *buf, size_t n, float spl)
+{
+    if (spl < 0.0f) {
+        snprintf(buf, n, "i--.-");
+        return;
+    }
+    // Round first so 99.96 shows as 100.0, not 99.10.
+    const float v = roundf((spl > 199.9f ? 199.9f : spl) * 10.0f) / 10.0f;
+    if (v >= 100.0f) snprintf(buf, n, "I%04.1f", v - 100.0f);
+    else snprintf(buf, n, "i%4.1f", v);
+}
+
 void update_cal_label()
 {
     char buf[48];
@@ -199,7 +215,7 @@ void ui_timer_cb(lv_timer_t *)
         l = g_levels;
     }
     if (!g_audio_ok) {
-        lv_label_set_text(ui.value, "--.-");
+        seg7_set_text(ui.value, "i--.-");
         lv_label_set_text(ui.stats, "Microphone not available");
         return;
     }
@@ -207,8 +223,8 @@ void ui_timer_cb(lv_timer_t *)
     const float main_db = to_spl(ui.slow ? l.las : l.laf);
     char buf[128], a[16], b[16], c[16];
 
-    fmt_db(buf, sizeof(buf), main_db);
-    lv_label_set_text(ui.value, buf);
+    fmt_seg7(buf, sizeof(buf), main_db);
+    seg7_set_text(ui.value, buf);
 
     const float clamped = main_db < kArcMinDb ? kArcMinDb : (main_db > kArcMaxDb ? kArcMaxDb : main_db);
     lv_arc_set_value(ui.arc, (int32_t)lroundf(clamped * 10.0f));
@@ -371,11 +387,12 @@ void build_ui()
     lv_obj_add_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
 
     // Big reading; tap it to switch Fast / Slow.
-    ui.value = make_label(scr, &lv_font_montserrat_48, kColText, "--.-");
-    lv_obj_set_style_transform_scale(ui.value, 600, 0);  // 1.56x
-    lv_obj_set_style_transform_pivot_x(ui.value, LV_PCT(50), 0);
-    lv_obj_set_style_transform_pivot_y(ui.value, LV_PCT(50), 0);
-    lv_obj_align(ui.value, LV_ALIGN_CENTER, 0, -55);
+    // Seven-segment readout: narrow "1" cell for hundreds, then "88.8".
+    slm::Seg7Geometry seg;  // defaults: 54 x 100 digits, 12 px segments
+    ui.value = seg7_create(scr, seg, "I88.8");
+    seg7_set_colors(ui.value, kColText, lv_color_hex(0x1C1C1C));
+    seg7_set_text(ui.value, "i--.-");
+    lv_obj_align(ui.value, LV_ALIGN_CENTER, 0, -62);
     lv_obj_add_flag(ui.value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(ui.value, 30);
     lv_obj_add_event_cb(ui.value, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
