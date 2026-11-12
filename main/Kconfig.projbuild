@@ -1,0 +1,23 @@
+menu "Sound Level Meter"
+
+    config SLM_MIC_GAIN_DB
+        int "ES7210 microphone PGA gain (dB)"
+        range 0 37
+        default 12
+        help
+            Analog gain applied by the ES7210 before the ADC (3 dB steps
+            are typical; the driver picks the nearest step). Lower gain
+            raises the maximum measurable level, higher gain lowers the
+            noise floor. Calibration is stored relative to 0 dB gain, so
+            changing this does not require recalibrating.
+
+    config SLM_CAL_OFFSET_X10
+        int "Default calibration offset at 0 dB gain (tenths of a dB)"
+        default 1350
+        help
+            dB SPL = dBFS(RMS) - PGA gain + offset. The default (135.0 dB)
+            is an estimate for a -38 dBV/Pa MEMS microphone; calibrate
+            against a reference meter or 94 dB calibrator using the on-screen
+            Cal page, which saves the result to NVS and overrides this value.
+
+endmenu

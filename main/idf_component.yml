@@ -1,0 +1,9 @@
+## IDF Component Manager Manifest File
+dependencies:
+  idf:
+    version: ">=5.5"
+  # Board support package: CO5300 AMOLED, CST9220 touch, ES8311/ES7210 audio, LVGL glue
+  waveshare/esp32_s3_touch_amoled_2_16:
+    version: "^2.0.1"
+  lvgl/lvgl:
+    version: "^9.2"
