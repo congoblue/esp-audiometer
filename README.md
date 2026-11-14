@@ -11,9 +11,9 @@ levels on the 480×480 AMOLED.
 |---|---|
 | Big number | LAF (Fast, 125 ms) or LAS (Slow, 1 s). Tap the number to switch. |
 | Arc gauge | 30–130 dB(A). Green below 70, amber 70–85, red at 85 and above. |
-| LAeq / Max / Min | Equivalent continuous level, and the max and min of LAF, since the last **Reset**. |
+| LAeq 15m | Equivalent continuous level over the last 15 minutes (rolling). Until 15 minutes have passed since power-on or **Reset**, it covers the time so far. |
+| Max / Min | Max and min of LAF since the last **Reset**. |
 | Mic 1 / Mic 2 | LAF of each capsule on its own. A large gap means one mic is blocked or faulty. |
-| Timer | How long LAeq has been running. |
 | OVERLOAD | Either mic hit ADC full scale in the last second, so the reading is not valid. |
 
 **Cal** opens a calibration page with ±0.1 and ±1 dB steps. The value is saved to NVS.

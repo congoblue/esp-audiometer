@@ -336,9 +336,61 @@ static int check_battery()
     return fails;
 }
 
+// Rolling 15-minute LAeq: 5 min loud then quiet. Runs at 8 kHz to keep the
+// 20 simulated minutes quick; the window logic does not depend on fs.
+static int check_rolling_leq()
+{
+    const double fs = 8000;
+    slm::LevelMeter m(fs);
+    const int blk = 400;  // 50 ms
+    std::vector<float> l(blk), r(blk);
+    long long i = 0;
+    auto run = [&](double amp, double seconds) {
+        const long long blocks = (long long)(seconds * fs / blk);
+        for (long long b = 0; b < blocks; ++b) {
+            for (int k = 0; k < blk; ++k, ++i) l[k] = r[k] = float(amp * std::sin(2 * M_PI * 1000.0 * i / fs));
+            m.process(l.data(), r.data(), blk);
+        }
+    };
+    const double loud = 0.1, quiet = 0.01;  // 20 dB apart
+    const double e_loud = loud * loud / 2, e_quiet = quiet * quiet / 2;
+    auto db = [](double e) { return 10 * std::log10(e); };
+
+    int fails = 0;
+    auto check = [&](const char *what, double got, double want, double tol) {
+        const bool ok = std::fabs(got - want) <= tol;
+        std::printf("rolling LAeq: %-38s %7.2f dB (want %7.2f)%s\n", what, got, want, ok ? "" : "  << FAIL");
+        fails += !ok;
+    };
+
+    run(loud, 300.5);  // 5 min (+0.5 s settling, which is excluded)
+    slm::Levels s = m.snapshot();
+    check("after 5 min loud", s.laeq, db(e_loud), 0.05);
+    check("  covers (seconds)", s.leq_seconds, 300, 0.1);
+
+    run(quiet, 600);   // window now holds 5 min loud + 10 min quiet
+    s = m.snapshot();
+    check("5 min loud + 10 min quiet", s.laeq, db((5 * e_loud + 10 * e_quiet) / 15), 0.05);
+    check("  covers (seconds)", s.leq_seconds, 900, 0.1);
+
+    run(quiet, 300);   // loud part has now left the 15-minute window
+    s = m.snapshot();
+    check("15 min quiet (loud dropped out)", s.laeq, db(e_quiet), 0.05);
+    check("  still covers (seconds)", s.leq_seconds, 900, 0.1);
+
+    run(loud, 60);
+    m.reset_stats();
+    run(quiet, 10);
+    s = m.snapshot();
+    check("reset, then 10 s quiet", s.laeq, db(e_quiet), 0.05);
+    check("  covers (seconds)", s.leq_seconds, 10, 0.1);
+    return fails;
+}
+
 int main()
 {
     int failures = 0;
+    failures += check_rolling_leq();
     failures += check_battery();
     failures += check_seg7();
     failures += check_orientation();

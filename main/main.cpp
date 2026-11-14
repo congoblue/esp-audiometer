@@ -154,12 +154,12 @@ struct Ui {
     lv_obj_t *value;
     lv_obj_t *mode;
     lv_obj_t *over;
-    lv_obj_t *stats;
-    lv_obj_t *mics;
-    lv_obj_t *duration;
+    lv_obj_t *leq;
+    lv_obj_t *maxmin;
     lv_obj_t *cal_panel;
     lv_obj_t *cal_value;
     lv_obj_t *cal_live;
+    lv_obj_t *cal_mics;
     lv_obj_t *battery;
     lv_obj_t *power_overlay;
     lv_obj_t *power_label;
@@ -190,19 +190,21 @@ void fmt_db(char *buf, size_t n, float spl)
     else snprintf(buf, n, "%.1f", spl);
 }
 
-// Main reading for the seven-segment display. The hundreds place is a narrow
-// "1"-only cell ('I' lit, 'i' unlit), then "DD.D", so the digits never shift:
-//   54.3 -> "i54.3"   105.2 -> "I05.2"   no reading -> "i--.-"
+// Main reading for the seven-segment display, in whole dB. The hundreds place
+// is a narrow "1"-only cell ('I' lit, 'i' unlit), then two digits, so the
+// digits never shift:
+//   54.49 -> "i54"   54.5 -> "i55"   99.5 -> "I00"   no reading -> "i--"
+// roundf rounds halves away from zero, so for these positive levels .5 and
+// above round up and anything below .5 rounds down.
 void fmt_seg7(char *buf, size_t n, float spl)
 {
     if (spl < 0.0f) {
-        snprintf(buf, n, "i--.-");
+        snprintf(buf, n, "i--");
         return;
     }
-    // Round first so 99.96 shows as 100.0, not 99.10.
-    const float v = roundf((spl > 199.9f ? 199.9f : spl) * 10.0f) / 10.0f;
-    if (v >= 100.0f) snprintf(buf, n, "I%04.1f", v - 100.0f);
-    else snprintf(buf, n, "i%4.1f", v);
+    const int v = (int)roundf(spl > 199.0f ? 199.0f : spl);  // round before splitting off the hundreds
+    if (v >= 100) snprintf(buf, n, "I%02d", v - 100);
+    else snprintf(buf, n, "i%2d", v);
 }
 
 void update_cal_label()
@@ -238,8 +240,9 @@ void ui_timer_cb(lv_timer_t *)
     update_power_overlay();
 
     if (!g_audio_ok) {
-        seg7_set_text(ui.value, "i--.-");
-        lv_label_set_text(ui.stats, "Microphone not available");
+        seg7_set_text(ui.value, "i--");
+        lv_label_set_text(ui.leq, "Microphone not available");
+        lv_label_set_text(ui.maxmin, "");
         return;
     }
 
@@ -254,19 +257,13 @@ void ui_timer_cb(lv_timer_t *)
     lv_obj_set_style_arc_color(ui.arc, level_colour(main_db), LV_PART_INDICATOR);
 
     fmt_db(a, sizeof(a), to_spl(l.laeq));
+    snprintf(buf, sizeof(buf), "LAeq 15m %s", a);  // rolling 15-minute window
+    lv_label_set_text(ui.leq, buf);
+
     fmt_db(b, sizeof(b), to_spl(l.lafmax));
     fmt_db(c, sizeof(c), to_spl(l.lafmin));
-    snprintf(buf, sizeof(buf), "LAeq %s  Max %s  Min %s", a, b, c);
-    lv_label_set_text(ui.stats, buf);
-
-    fmt_db(a, sizeof(a), to_spl(l.mic1));
-    fmt_db(b, sizeof(b), to_spl(l.mic2));
-    snprintf(buf, sizeof(buf), "Mic 1  %s     Mic 2  %s", a, b);
-    lv_label_set_text(ui.mics, buf);
-
-    const unsigned secs = (unsigned)l.leq_seconds;
-    snprintf(buf, sizeof(buf), "%02u:%02u:%02u", secs / 3600, (secs / 60) % 60, secs % 60);
-    lv_label_set_text(ui.duration, buf);
+    snprintf(buf, sizeof(buf), "Max %s   Min %s", b, c);
+    lv_label_set_text(ui.maxmin, buf);
 
     if (l.clipping) lv_obj_remove_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
     else lv_obj_add_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
@@ -275,6 +272,13 @@ void ui_timer_cb(lv_timer_t *)
         fmt_db(a, sizeof(a), to_spl(l.las));
         snprintf(buf, sizeof(buf), "Live LAS  %s dB(A)", a);
         lv_label_set_text(ui.cal_live, buf);
+
+        // Per-microphone levels: a large difference means one capsule is
+        // blocked or faulty, which would spoil a calibration.
+        fmt_db(a, sizeof(a), to_spl(l.mic1));
+        fmt_db(b, sizeof(b), to_spl(l.mic2));
+        snprintf(buf, sizeof(buf), "Mic 1  %s     Mic 2  %s", a, b);
+        lv_label_set_text(ui.cal_mics, buf);
     }
 }
 
@@ -357,10 +361,13 @@ void build_cal_panel(lv_obj_t *scr)
     lv_obj_align(help, LV_ALIGN_TOP_MID, 0, 100);
 
     ui.cal_live = make_label(p, &lv_font_montserrat_24, kColGreen, "");
-    lv_obj_align(ui.cal_live, LV_ALIGN_CENTER, 0, -40);
+    lv_obj_align(ui.cal_live, LV_ALIGN_CENTER, 0, -56);
+
+    ui.cal_mics = make_label(p, &lv_font_montserrat_16, kColDim, "");
+    lv_obj_align(ui.cal_mics, LV_ALIGN_CENTER, 0, -24);
 
     ui.cal_value = make_label(p, &lv_font_montserrat_20, kColText, "");
-    lv_obj_align(ui.cal_value, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(ui.cal_value, LV_ALIGN_CENTER, 0, 10);
 
     struct Step { const char *text; int tenths; };
     const Step steps[] = {{"-1", -10}, {"-0.1", -1}, {"+0.1", 1}, {"+1", 10}};
@@ -405,32 +412,32 @@ void build_ui()
     lv_obj_t *hi = make_label(scr, &lv_font_montserrat_16, kColDim, "130");
     lv_obj_align(hi, LV_ALIGN_CENTER, 140, 172);*/
 
+    // Vertical layout, offsets from the screen centre (reading 100 px tall):
+    //   OVERLOAD -100 | reading -12 (-62..38) | mode 54 | LAeq 88 | Max/Min 114
+    //   | Reset/Cal buttons 160 | battery icon at the bottom edge
     ui.over = make_label(scr, &lv_font_montserrat_24, kColRed, "OVERLOAD");
-    lv_obj_align(ui.over, LV_ALIGN_CENTER, 0, -130);
+    lv_obj_align(ui.over, LV_ALIGN_CENTER, 0, -100);
     lv_obj_add_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
 
     // Big reading; tap it to switch Fast / Slow.
     // Seven-segment readout: narrow "1" cell for hundreds, then "88.8".
     slm::Seg7Geometry seg;  // defaults: 54 x 100 digits, 12 px segments
-    ui.value = seg7_create(scr, seg, "I88.8");
+    ui.value = seg7_create(scr, seg, "I88");
     seg7_set_colors(ui.value, kColText, lv_color_hex(0x1C1C1C));
-    seg7_set_text(ui.value, "i--.-");
-    lv_obj_align(ui.value, LV_ALIGN_CENTER, 0, -62);
+    seg7_set_text(ui.value, "i--");
+    lv_obj_align(ui.value, LV_ALIGN_CENTER, 0, -12);
     lv_obj_add_flag(ui.value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(ui.value, 30);
     lv_obj_add_event_cb(ui.value, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
 
     ui.mode = make_label(scr, &lv_font_montserrat_24, kColDim, "dB(A)  FAST");
-    lv_obj_align(ui.mode, LV_ALIGN_CENTER, 0, 5);
+    lv_obj_align(ui.mode, LV_ALIGN_CENTER, 0, 54);
 
-    ui.stats = make_label(scr, &lv_font_montserrat_20, kColText, "");
-    lv_obj_align(ui.stats, LV_ALIGN_CENTER, 0, 50);
+    ui.leq = make_label(scr, &lv_font_montserrat_20, kColText, "");
+    lv_obj_align(ui.leq, LV_ALIGN_CENTER, 0, 88);
 
-    ui.mics = make_label(scr, &lv_font_montserrat_16, kColDim, "");
-    lv_obj_align(ui.mics, LV_ALIGN_CENTER, 0, 82);
-
-    ui.duration = make_label(scr, &lv_font_montserrat_16, kColDim, "00:00:00");
-    lv_obj_align(ui.duration, LV_ALIGN_CENTER, 0, 106);
+    ui.maxmin = make_label(scr, &lv_font_montserrat_20, kColText, "");
+    lv_obj_align(ui.maxmin, LV_ALIGN_CENTER, 0, 114);
 
     lv_obj_t *reset = make_button(scr, "Reset", 120, 52, on_reset, nullptr);
     lv_obj_align(reset, LV_ALIGN_CENTER, -66, 160);
