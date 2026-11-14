@@ -72,24 +72,48 @@ Settings are under `idf.py menuconfig` → **Sound Level Meter**:
 | `SLM_MIC_GAIN_DB` | 12 | ES7210 PGA gain. Lower it for very loud sources, raise it for quiet rooms. Calibration is stored relative to 0 dB gain, so you do not need to recalibrate after changing it. |
 | `SLM_CAL_OFFSET_X10` | 1350 | Default offset of 135.0 dB, used until you save a calibration on the device. |
 
-## Spectrum screen
+## Screens
 
-Tap **Analyser** on the meter screen to open the spectrum analyser. Tap
-**dB meter** (bottom centre, above the battery icon) to go back.
+There are three screens. The button at the bottom centre (above the battery
+icon) moves to the next one in turn:
+
+**dB meter** → **Analyser** → **History** → **dB meter**
+
+On the meter screen the button is **Analyser**, next to **Cal**. The analyser
+and history screens both show the current dB(A) bottom left and LAeq 15m
+bottom right, on 7-segment readouts. Tap the dB(A) readout to switch between
+Fast and Slow; the setting is shared by all three screens.
+
+## Spectrum screen
 
 - 64 bars on a log frequency scale from 50 Hz to 13 kHz (the interference
   low-pass removes everything above), taken from the
-  average of both mics. Bars are mirrored about a centre line and coloured red
-  to violet, with falling peak markers, in the style of Waveshare's
-  `05_Spec_Analyzer` demo.
+  average of both mics. Bars rise from a row of zero-position dots just above
+  the readouts and are coloured red to violet. Bars fall back at up to
+  75 px/s and the peak markers at 25 px/s, in the style of
+  Waveshare's `05_Spec_Analyzer` demo.
 - The bars show unweighted levels per band in dB SPL, using the same
-  calibration as the meter. The centre line is 20 dB and full height is
+  calibration as the meter. The zero dots are 20 dB and full height is
   100 dB, with a square-root scale as in the demo.
-- Bottom left shows the current dB(A) on a 7-segment readout. Tap it to
-  switch between Fast and Slow; the setting is shared with the meter screen.
-  Bottom right shows LAeq 15m, also on a 7-segment readout.
 - 4096-point FFT (85 ms window, 11.7 Hz bins), refreshed 25 times a second.
   It only runs while the spectrum screen is showing.
+
+## History screen
+
+A rolling bar graph of dB(A) over the last 15 minutes
+([main/level_history.hpp](main/level_history.hpp),
+[main/history_view.cpp](main/history_view.cpp)).
+
+- 90 bars, each the LAeq of 10 seconds. The newest bar is on the right and is
+  updated every second while it fills; then the graph moves one bar to the
+  left.
+- History is recorded from power-on whichever screen is showing, so opening
+  the screen shows the last 15 minutes straight away.
+- The vertical scale fits the levels on screen, in 10 dB steps (at least
+  30 dB tall), with labelled grid lines down the left.
+- Colours are relative to what is on screen: the quietest bar is violet and
+  the loudest red. When all the levels are within 6 dB of each other, the
+  colours stay at the violet end, so small changes don't look dramatic.
 
 ## Auto-rotation
 

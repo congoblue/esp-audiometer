@@ -16,6 +16,7 @@
 
 #include "a_weighting.hpp"
 #include "battery_status.hpp"
+#include "level_history.hpp"
 #include "level_meter.hpp"
 #include "lowpass.hpp"
 #include "orientation.hpp"
@@ -508,12 +509,55 @@ static int check_lowpass()
     return fails;
 }
 
+// History screen: bars of 10 s, newest bar partial, window capped at 90 bars,
+// meter hands over exactly one mean square per second.
+static int check_history()
+{
+    int fails = 0;
+    auto need = [&](const char *what, bool ok) {
+        if (!ok) { std::printf("history: FAIL %s\n", what); ++fails; }
+    };
+    slm::LevelHistory h(90, 10);
+    std::vector<double> out(90);
+    need("empty at start", h.copy(out.data()) == 0);
+
+    // 3 s at 1.0 then the bar is still filling: one partial bar of 1.0.
+    for (int i = 0; i < 3; ++i) h.push_second(1.0);
+    need("partial bar after 3 s", h.copy(out.data()) == 1 && out[0] == 1.0);
+
+    // Finish the bar with 7 s of 0 -> energy average 0.3; nothing partial.
+    for (int i = 0; i < 7; ++i) h.push_second(0.0);
+    size_t n = h.copy(out.data());
+    need("one complete bar, Leq = 0.3", n == 1 && std::fabs(out[0] - 0.3) < 1e-12);
+
+    // 20 minutes of seconds numbered by bar: window holds 89 complete + 1 partial.
+    slm::LevelHistory g(90, 10);
+    for (int s = 0; s < 1205; ++s) g.push_second(double(s / 10));
+    n = g.copy(out.data());
+    need("15 min window is 90 bars", n == 90);
+    need("oldest bar is from 15 min ago", out[0] == 31.0);
+    need("newest complete bar", out[88] == 119.0);
+    need("partial bar is the current one", out[89] == 120.0);
+    const uint32_t v = g.version();
+    g.push_second(1.0);
+    need("version moves", g.version() != v);
+
+    // LevelMeter hands over each second exactly once.
+    slm::LevelMeter m(8000);
+    std::vector<float> x(8000 * 3, 0.1f);
+    m.process(x.data(), x.data(), x.size());  // 3 s minus the 0.5 s settle
+    need("meter seconds_done counts whole seconds", m.seconds_done() == 2);
+    std::printf("history: %s\n", fails ? "FAILED" : "ok");
+    return fails;
+}
+
 int main()
 {
     int failures = 0;
     failures += check_lowpass();
     failures += check_spectrum();
     failures += check_rolling_leq();
+    failures += check_history();
     failures += check_battery();
     failures += check_seg7(slm::Seg7Geometry{}, true);  // main reading (defaults)
     {

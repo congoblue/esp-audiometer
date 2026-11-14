@@ -6,11 +6,13 @@ namespace {
 
 constexpr int32_t kGap = 2;          // pixels between bars
 constexpr int32_t kPeakH = 3;        // peak marker thickness
-constexpr float kPeakFallPx = 2.0f;  // per update
+constexpr float kBarFallPx = 4.0f;   // max bar fall per update (rises are instant)
+constexpr float kPeakFallPx = 1.0f;  // peak marker fall per update
+constexpr int32_t kDotH = 3;         // "zero position" dot under each bar
 
 struct SpecState {
     int bars;
-    std::vector<float> level_px;  // bar half-height in pixels
+    std::vector<float> level_px;  // bar height in pixels
     std::vector<float> peak_px;   // peak marker position in pixels
     std::vector<lv_color_t> colour;
 };
@@ -25,6 +27,10 @@ void fill(lv_layer_t *layer, lv_color_t c, int32_t x1, int32_t y1, int32_t x2, i
     lv_draw_rect(layer, &d, &a);
 }
 
+// Usable bar height for a widget of height h: room is left for the zero
+// dot (plus 1 px gap) below and the peak marker (plus 1 px gap) above.
+int32_t bar_area(int32_t h) { return h - kDotH - 1 - kPeakH - 1; }
+
 void draw_cb(lv_event_t *e)
 {
     const auto *st = static_cast<SpecState *>(lv_event_get_user_data(e));
@@ -32,23 +38,23 @@ void draw_cb(lv_event_t *e)
     lv_area_t c;
     lv_obj_get_coords(lv_event_get_target_obj(e), &c);
 
-    const int32_t w = lv_area_get_width(&c), h = lv_area_get_height(&c);
+    const int32_t w = lv_area_get_width(&c);
     const int32_t pitch = w / st->bars;
     const int32_t x0 = c.x1 + (w - pitch * st->bars) / 2;  // centre the bars
-    const int32_t mid = c.y1 + h / 2;
-    const int32_t max_half = h / 2 - kPeakH;
+    const int32_t base = c.y2 - kDotH - 1;                  // bottom row of the bars
+    const int32_t max_h = bar_area(lv_area_get_height(&c));
 
     for (int i = 0; i < st->bars; ++i) {
         const int32_t xa = x0 + i * pitch + kGap / 2;
         const int32_t xb = xa + pitch - kGap - 1;
         int32_t bh = (int32_t)st->level_px[i];
-        if (bh > max_half) bh = max_half;
-        if (bh > 0) fill(layer, st->colour[i], xa, mid - bh, xb, mid + bh - 1);
+        if (bh > max_h) bh = max_h;
+        fill(layer, st->colour[i], xa, c.y2 - kDotH + 1, xb, c.y2);  // zero dot, always shown
+        if (bh > 0) fill(layer, st->colour[i], xa, base - bh + 1, xb, base);
 
         int32_t pk = (int32_t)st->peak_px[i];
-        if (pk > max_half) pk = max_half;
-        fill(layer, st->colour[i], xa, mid - pk - kPeakH, xb, mid - pk - 1);  // top marker
-        fill(layer, st->colour[i], xa, mid + pk, xb, mid + pk + kPeakH - 1);  // bottom marker
+        if (pk > max_h) pk = max_h;
+        if (pk > 0) fill(layer, st->colour[i], xa, base - pk - kPeakH, xb, base - pk - 1);  // peak marker
     }
 }
 
@@ -81,13 +87,15 @@ lv_obj_t *spectrum_view_create(lv_obj_t *parent, int32_t w, int32_t h, int bars)
 void spectrum_view_set(lv_obj_t *obj, const float *levels)
 {
     auto *st = static_cast<SpecState *>(lv_obj_get_user_data(obj));
-    const float half = lv_obj_get_height(obj) / 2.0f - kPeakH;
+    const float full = (float)bar_area(lv_obj_get_height(obj));
     for (int i = 0; i < st->bars; ++i) {
         float v = levels[i];
         v = v < 0 ? 0 : (v > 1 ? 1 : v);
-        const float px = v * half;
-        st->level_px[i] = px;
-        if (px >= st->peak_px[i]) st->peak_px[i] = px;
+        const float px = v * full;
+        // Bars jump up at once but fall at most kBarFallPx per update.
+        const float fallen = st->level_px[i] - kBarFallPx;
+        st->level_px[i] = px > fallen ? px : fallen;
+        if (st->level_px[i] >= st->peak_px[i]) st->peak_px[i] = st->level_px[i];
         else st->peak_px[i] = st->peak_px[i] > kPeakFallPx ? st->peak_px[i] - kPeakFallPx : 0.0f;
     }
     lv_obj_invalidate(obj);

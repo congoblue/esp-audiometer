@@ -25,6 +25,8 @@
 #include "lvgl.h"
 
 #include "auto_rotate.hpp"
+#include "history_view.hpp"
+#include "level_history.hpp"
 #include "level_meter.hpp"
 #include "seg7_widget.hpp"
 #include "spectrum.hpp"
@@ -86,13 +88,22 @@ void save_calibration()
 float to_spl(float dbfs) { return dbfs - kMicGainDb + g_cal_offset; }
 
 // ---------------------------------------------------------------------------
+// History screen data: 90 bars x 10 s = the last 15 minutes. The audio task
+// adds each finished second; the UI copies it when it changes.
+// ---------------------------------------------------------------------------
+constexpr int kHistBars = 90;
+constexpr int kHistSecondsPerBar = 10;
+std::mutex g_hist_mutex;
+slm::LevelHistory g_history(kHistBars, kHistSecondsPerBar);
+
+// ---------------------------------------------------------------------------
 // Spectrum analyser data
 // ---------------------------------------------------------------------------
 using slm::SpectrumAnalyzer;
 constexpr size_t kSpecN = SpectrumAnalyzer::kN;
 constexpr int kSpecBands = SpectrumAnalyzer::kBands;
 constexpr uint32_t kSpecFrameMs = 40;   // 25 frames per second
-constexpr float kSpecMinDb = 20.0f;     // band level (dB SPL) at the centre line
+constexpr float kSpecMinDb = 20.0f;     // band level (dB SPL) at the baseline
 constexpr float kSpecMaxDb = 100.0f;    // band level (dB SPL) at full height
 
 std::atomic<bool> g_spec_on{false};     // spectrum screen visible
@@ -191,6 +202,7 @@ void audio_task(void *arg)
     static slm::LevelMeter meter(kSampleRate);
     constexpr float kScale = 1.0f / 2147483648.0f;
     int64_t last_log = 0;
+    uint64_t seconds_seen = 0;
 
     while (true) {
         if (esp_codec_dev_read(mic, s_raw, sizeof(s_raw)) != ESP_CODEC_DEV_OK) {
@@ -206,6 +218,11 @@ void audio_task(void *arg)
         if (g_reset_request.exchange(false)) meter.reset_stats();
         meter.process(s_left, s_right, kBlockFrames);
         if (g_spec_on && g_spec_ring) spec_push(s_left, s_right, kBlockFrames);
+        if (meter.seconds_done() != seconds_seen) {  // a second finished in this block
+            seconds_seen = meter.seconds_done();
+            std::lock_guard<std::mutex> lock(g_hist_mutex);
+            g_history.push_second(meter.last_second_ms());
+        }
 
         const slm::Levels snap = meter.snapshot();
         {
@@ -226,13 +243,28 @@ void audio_task(void *arg)
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
+// The bottom button on each screen moves to the next: meter -> analyser ->
+// history -> meter.
+enum class Screen { Meter, Analyser, History };
+
+// dB(A) (tap for Fast/Slow) and LAeq 15m readouts in the bottom corners of
+// the analyser and history screens.
+struct CornerReadouts {
+    lv_obj_t *dba;      // seven-segment
+    lv_obj_t *dba_cap;
+    lv_obj_t *leq;      // seven-segment
+};
+
 struct Ui {
+    Screen screen = Screen::Meter;
     lv_obj_t *main_view;   // sound level meter screen
     lv_obj_t *spec_view;   // spectrum analyser screen
     lv_obj_t *spec;
-    lv_obj_t *spec_dba;      // seven-segment, tap for Fast/Slow
-    lv_obj_t *spec_dba_cap;
-    lv_obj_t *spec_leq;      // seven-segment
+    CornerReadouts spec_corners;
+    lv_obj_t *hist_view;   // history screen
+    lv_obj_t *hist;
+    CornerReadouts hist_corners;
+    uint32_t hist_version = UINT32_MAX;  // history version last drawn
     lv_obj_t *arc;
     lv_obj_t *value;
     lv_obj_t *mode;
@@ -317,6 +349,22 @@ void update_power_overlay()
     lv_obj_remove_flag(ui.power_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
+// Redraws the history graph when a new second has been added.
+void update_history()
+{
+    double ms[kHistBars];
+    size_t n;
+    {
+        std::lock_guard<std::mutex> lock(g_hist_mutex);
+        if (g_history.version() == ui.hist_version) return;
+        ui.hist_version = g_history.version();
+        n = g_history.copy(ms);
+    }
+    float db[kHistBars];
+    for (size_t i = 0; i < n; ++i) db[i] = to_spl(slm::LevelMeter::to_db((float)ms[i]));
+    history_view_set(ui.hist, db, (int)n);
+}
+
 void ui_timer_cb(lv_timer_t *)
 {
     slm::Levels l;
@@ -350,13 +398,15 @@ void ui_timer_cb(lv_timer_t *)
     fmt_seg7(buf, sizeof(buf), leq_db);
     seg7_set_text(ui.leq, buf);
 
-    // Analyser screen corners: dB(A) and LAeq 15m, both in whole dB.
-    if (g_spec_on) {
+    // Analyser / history screen corners: dB(A) and LAeq 15m, in whole dB.
+    if (ui.screen != Screen::Meter) {
+        const CornerReadouts &c = ui.screen == Screen::Analyser ? ui.spec_corners : ui.hist_corners;
         fmt_seg7(buf, sizeof(buf), main_db);
-        seg7_set_text(ui.spec_dba, buf);
+        seg7_set_text(c.dba, buf);
         fmt_seg7(buf, sizeof(buf), leq_db);
-        seg7_set_text(ui.spec_leq, buf);
+        seg7_set_text(c.leq, buf);
     }
+    if (ui.screen == Screen::History) update_history();
 
     if (l.clipping) {
         set_label(ui.over, "OVERLOAD");
@@ -405,7 +455,8 @@ void on_toggle_mode(lv_event_t *)
 {
     ui.slow = !ui.slow;
     lv_label_set_text(ui.mode, ui.slow ? "dB(A)  SLOW" : "dB(A)  FAST");
-    lv_label_set_text(ui.spec_dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
+    lv_label_set_text(ui.spec_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
+    lv_label_set_text(ui.hist_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
 }
 
 // ---------------------------------------------------------------------------
@@ -432,42 +483,48 @@ void spec_timer_cb(lv_timer_t *)
     spectrum_view_set(ui.spec, level);
 }
 
-void show_spectrum(bool on)
+void show_screen(Screen next)
 {
-    if (on) {
-        if (g_spec_ring == nullptr) return;  // analyser unavailable
-        {
+    if (next == Screen::Analyser) {
+        if (g_spec_ring == nullptr) {
+            next = Screen::History;  // analyser unavailable
+        } else {
             std::lock_guard<std::mutex> lock(g_spec_mutex);
             memset(g_spec_ring, 0, kSpecN * sizeof(float));  // no stale audio from last time
             g_spec_fresh = false;
         }
-        lv_obj_add_flag(ui.main_view, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(ui.spec_view, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(ui.spec_view, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_remove_flag(ui.main_view, LV_OBJ_FLAG_HIDDEN);
     }
-    g_spec_on = on;
+    if (next == Screen::History) ui.hist_version = UINT32_MAX;  // redraw on the next update
+
+    ui.screen = next;
+    g_spec_on = next == Screen::Analyser;
+    lv_obj_t *const views[] = {ui.main_view, ui.spec_view, ui.hist_view};
+    for (int i = 0; i < 3; ++i) {
+        if (i == (int)next) lv_obj_remove_flag(views[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(views[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
-void on_show_analyser(lv_event_t *) { show_spectrum(true); }
-void on_show_meter(lv_event_t *) { show_spectrum(false); }
+void on_show_screen(lv_event_t *e) { show_screen((Screen)(intptr_t)lv_event_get_user_data(e)); }
 
-void build_spectrum_view(lv_obj_t *scr)
+// Full-screen container for one screen.
+lv_obj_t *make_view(lv_obj_t *scr)
 {
     lv_obj_t *v = lv_obj_create(scr);
-    ui.spec_view = v;
     lv_obj_remove_style_all(v);
     lv_obj_set_size(v, BSP_LCD_H_RES, BSP_LCD_V_RES);
     lv_obj_remove_flag(v, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(v, LV_OBJ_FLAG_CLICKABLE);
+    return v;
+}
 
-    // 64 bars x 6 px = 384 px wide, 280 px tall (140 px each side of centre).
-    ui.spec = spectrum_view_create(v, 384, 280, kSpecBands);
-    lv_obj_align(ui.spec, LV_ALIGN_CENTER, 0, -50);
-
-    // Small seven-segment readouts for the bottom corners: 30 x 56 px digits.
-    // "I88" is 85 px wide.
+// Bottom corners: dB(A) on the left (tap for Fast / Slow, shared with the
+// meter screen), LAeq 15m on the right, as small seven-segment readouts with
+// captions below. Bottom centre, above the battery icon: the button to the
+// next screen.
+void build_corners(lv_obj_t *v, CornerReadouts &c, const char *next_text, Screen next)
+{
+    // 30 x 56 px digits; "I88" is 85 px wide.
     slm::Seg7Geometry small;
     small.digit_w = 30;
     small.digit_h = 56;
@@ -478,32 +535,56 @@ void build_spectrum_view(lv_obj_t *scr)
     small.dp_spacing = 4;
     const lv_color_t ghost = lv_color_hex(0x1C1C1C);
 
-    // Bottom-left: current dB(A). Tap to switch Fast / Slow (shared with the
-    // meter screen).
-    ui.spec_dba = seg7_create(v, small, "I88");
-    seg7_set_colors(ui.spec_dba, kColText, ghost);
-    seg7_set_text(ui.spec_dba, "i--");
-    lv_obj_align(ui.spec_dba, LV_ALIGN_BOTTOM_LEFT, 44, -66);
-    lv_obj_add_flag(ui.spec_dba, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_ext_click_area(ui.spec_dba, 24);
-    lv_obj_add_event_cb(ui.spec_dba, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
-    ui.spec_dba_cap = make_label(v, &lv_font_montserrat_16, kColDim, "dB(A) FAST");
-    lv_obj_align_to(ui.spec_dba_cap, ui.spec_dba, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+    c.dba = seg7_create(v, small, "I88");
+    seg7_set_colors(c.dba, kColText, ghost);
+    seg7_set_text(c.dba, "i--");
+    lv_obj_align(c.dba, LV_ALIGN_BOTTOM_LEFT, 44, -66);
+    lv_obj_add_flag(c.dba, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(c.dba, 24);
+    lv_obj_add_event_cb(c.dba, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
+    c.dba_cap = make_label(v, &lv_font_montserrat_16, kColDim, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
+    lv_obj_align_to(c.dba_cap, c.dba, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
 
-    // Bottom-right: LAeq over the last 15 minutes.
-    ui.spec_leq = seg7_create(v, small, "I88");
-    seg7_set_colors(ui.spec_leq, kColText, ghost);
-    seg7_set_text(ui.spec_leq, "i--");
-    lv_obj_align(ui.spec_leq, LV_ALIGN_BOTTOM_RIGHT, -44, -66);
+    c.leq = seg7_create(v, small, "I88");
+    seg7_set_colors(c.leq, kColText, ghost);
+    seg7_set_text(c.leq, "i--");
+    lv_obj_align(c.leq, LV_ALIGN_BOTTOM_RIGHT, -44, -66);
     lv_obj_t *cap_r = make_label(v, &lv_font_montserrat_16, kColDim, "LAeq 15m");
-    lv_obj_align_to(cap_r, ui.spec_leq, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 6);
+    lv_obj_align_to(cap_r, c.leq, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 6);
 
-    // Bottom-centre, above the battery icon: back to the meter screen.
-    lv_obj_t *meter = make_button(v, "dB meter", 128, 52, on_show_meter, nullptr);
-    lv_obj_align(meter, LV_ALIGN_BOTTOM_MID, 0, -54);
+    lv_obj_t *btn = make_button(v, next_text, 128, 52, on_show_screen, (void *)(intptr_t)next);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -54);
+}
+
+void build_spectrum_view(lv_obj_t *scr)
+{
+    lv_obj_t *v = make_view(scr);
+    ui.spec_view = v;
+
+    // 64 bars x 6 px = 384 px wide. Bars rise from y = 340, just above the
+    // corner readouts (their tops are at y = 358).
+    ui.spec = spectrum_view_create(v, 384, 300, kSpecBands);
+    lv_obj_align(ui.spec, LV_ALIGN_TOP_MID, 0, 40);
+
+    build_corners(v, ui.spec_corners, "History", Screen::History);
 
     lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
     lv_timer_create(spec_timer_cb, kSpecFrameMs, nullptr);
+}
+
+void build_history_view(lv_obj_t *scr)
+{
+    lv_obj_t *v = make_view(scr);
+    ui.hist_view = v;
+
+    // 40 px label column + 90 bars x 4 px = 400 px wide; same height and
+    // baseline as the analyser.
+    ui.hist = history_view_create(v, 400, 300, kHistBars);
+    lv_obj_align(ui.hist, LV_ALIGN_TOP_MID, 0, 40);
+
+    build_corners(v, ui.hist_corners, "dB meter", Screen::Meter);
+
+    lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
 }
 
 void on_cal_open(lv_event_t *)
@@ -586,14 +667,10 @@ void build_ui()
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Main (sound level meter) view: a transparent full-screen container so
-    // the user button can swap it with the spectrum view in one step.
-    lv_obj_t *mv = lv_obj_create(scr);
+    // Main (sound level meter) view: a transparent full-screen container, one
+    // of three (meter, analyser, history) that show_screen() switches between.
+    lv_obj_t *mv = make_view(scr);
     ui.main_view = mv;
-    lv_obj_remove_style_all(mv);
-    lv_obj_set_size(mv, BSP_LCD_H_RES, BSP_LCD_V_RES);
-    lv_obj_remove_flag(mv, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(mv, LV_OBJ_FLAG_CLICKABLE);
 
     // Gauge: 270 degree arc, opening at the bottom.
     ui.arc = lv_arc_create(mv);
@@ -653,12 +730,13 @@ void build_ui()
     lv_obj_t *leq_cap = make_label(mv, &lv_font_montserrat_16, kColDim, "LAeq 15m");
     lv_obj_align(leq_cap, LV_ALIGN_CENTER, 0, 96);
 
-    lv_obj_t *analyser = make_button(mv, "Analyser", 120, 52, on_show_analyser, nullptr);
+    lv_obj_t *analyser = make_button(mv, "Analyser", 120, 52, on_show_screen, (void *)(intptr_t)Screen::Analyser);
     lv_obj_align(analyser, LV_ALIGN_CENTER, -66, 160);
     lv_obj_t *cal = make_button(mv, "Cal", 120, 52, on_cal_open, nullptr);
     lv_obj_align(cal, LV_ALIGN_CENTER, 66, 160);
 
     build_spectrum_view(scr);
+    build_history_view(scr);
 
     // Battery icon, bottom centre in the gap of the arc, dimmed to 33 %
     // (opacity over the black background = brightness).

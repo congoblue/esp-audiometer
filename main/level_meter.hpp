@@ -30,6 +30,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "a_weighting.hpp"
@@ -139,6 +140,11 @@ public:
 
     static float to_db(float ms) { return 10.0f * std::log10(ms > 1e-20f ? ms : 1e-20f); }
 
+    // Whole seconds completed since power-on (not cleared by reset_stats),
+    // and the A-weighted mean square of the latest one. Used for the history.
+    uint64_t seconds_done() const { return seconds_done_; }
+    double last_second_ms() const { return last_second_ms_; }
+
 private:
     static constexpr float kClipLevel = 0.999f;
     static constexpr float kHuge = 1e30f;
@@ -146,7 +152,9 @@ private:
     // Store the finished second; drop the oldest once the window is full.
     void push_second()
     {
-        ring_[ring_head_] = second_sum_ / double(samples_per_second_);
+        last_second_ms_ = second_sum_ / double(samples_per_second_);
+        ++seconds_done_;
+        ring_[ring_head_] = last_second_ms_;
         ring_head_ = (ring_head_ + 1) % kLeqWindowSeconds;
         if (ring_count_ < kLeqWindowSeconds) ++ring_count_;
         second_sum_ = 0;
@@ -175,6 +183,8 @@ private:
     double ring_sum_ = 0;                  // sum of ring_[0 .. ring_count_)
     double second_sum_ = 0;                // sum of p in the current second
     size_t second_count_ = 0;
+    uint64_t seconds_done_ = 0;
+    double last_second_ms_ = 0;
 };
 
 }  // namespace slm
