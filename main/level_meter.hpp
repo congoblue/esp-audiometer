@@ -30,8 +30,10 @@
 
 #include <cmath>
 #include <cstddef>
+#include <vector>
 
 #include "a_weighting.hpp"
+#include "lowpass.hpp"
 
 namespace slm {
 
@@ -48,7 +50,7 @@ public:
     static constexpr size_t kLeqWindowSeconds = 15 * 60;
 
     explicit LevelMeter(double fs)
-        : fs_(fs), wa_(fs), w1_(fs), w2_(fs)
+        : fs_(fs), wa_(fs), w1_(fs), w2_(fs), lp_(fs), lp1_(fs), lp2_(fs)
     {
         alpha_fast_ = float(1.0 - std::exp(-1.0 / (fs * 0.125)));
         alpha_slow_ = float(1.0 - std::exp(-1.0 / (fs * 1.0)));
@@ -68,9 +70,11 @@ public:
             const float l = left[i], r = right[i];
             if (std::fabs(l) >= kClipLevel || std::fabs(r) >= kClipLevel) clipped = true;
 
-            const float y = wa_.process(0.5f * (l + r));
-            const float y1 = w1_.process(l);
-            const float y2 = w2_.process(r);
+            // Low-pass first (removes the board's ~14.8 kHz interference, see
+            // lowpass.hpp), then A-weighting.
+            const float y = wa_.process(lp_.process(0.5f * (l + r)));
+            const float y1 = w1_.process(lp1_.process(l));
+            const float y2 = w2_.process(lp2_.process(r));
             const float p = y * y;
 
             fast += alpha_fast_ * (p - fast);
@@ -156,6 +160,7 @@ private:
 
     double fs_;
     AWeighting wa_, w1_, w2_;
+    ChebyLowpass lp_, lp1_, lp2_;  // interference low-pass, 14.5 kHz stopband
     float alpha_fast_, alpha_slow_;
     float fast_ = 0, slow_ = 0, m1_ = 0, m2_ = 0;
     float max_ms_ = 0, min_ms_ = kHuge;
@@ -163,8 +168,9 @@ private:
     size_t settle_left_;
     size_t clip_left_ = 0, clip_hold_samples_;
 
-    // Rolling LAeq window
-    double ring_[kLeqWindowSeconds] = {};  // mean square of each second
+    // Rolling LAeq window: mean square of each second. Heap-allocated (7.2 KB)
+    // so on the ESP32-S3 it lands in PSRAM, not scarce internal RAM.
+    std::vector<double> ring_ = std::vector<double>(kLeqWindowSeconds, 0.0);
     size_t ring_head_ = 0, ring_count_ = 0;
     double ring_sum_ = 0;                  // sum of ring_[0 .. ring_count_)
     double second_sum_ = 0;                // sum of p in the current second

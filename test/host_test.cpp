@@ -17,8 +17,10 @@
 #include "a_weighting.hpp"
 #include "battery_status.hpp"
 #include "level_meter.hpp"
+#include "lowpass.hpp"
 #include "orientation.hpp"
 #include "seg7_layout.hpp"
+#include "spectrum.hpp"
 
 #include <string>
 
@@ -191,10 +193,9 @@ static int check_orientation()
 
 // Seven-segment layout: segment counts, fixed width, no overlaps, in bounds,
 // plus an ASCII preview of the digit shapes.
-static int check_seg7()
+static int check_seg7(const slm::Seg7Geometry &g, bool preview)
 {
     int fails = 0;
-    slm::Seg7Geometry g;  // the geometry used on the device
 
     const int expect_lit[10] = {6, 2, 5, 5, 4, 5, 6, 3, 7, 6};
     for (int d = 0; d < 10; ++d) {
@@ -262,6 +263,8 @@ static int check_seg7()
     }
     std::printf("\nseg7: \"I88.8\" is %d x %d px (\"888.8\" would be %d), %zu segments, %s\n", w, g.digit_h,
                 slm::seg7_width("888.8", g), segs.size(), fails ? "FAILED" : "ok");
+
+    if (!preview) return fails;
 
     // ASCII preview at reduced size: '#' lit, '.' unlit.
     slm::Seg7Geometry s;
@@ -387,12 +390,141 @@ static int check_rolling_leq()
     return fails;
 }
 
+// Spectrum analyser: FFT against a direct DFT, band layout, and band powers
+// that are true mean squares.
+static int check_spectrum()
+{
+    int fails = 0;
+    auto fail = [&](const char *fmt, double a, double b) {
+        std::printf("spectrum: ");
+        std::printf(fmt, a, b);
+        std::printf("  << FAIL\n");
+        ++fails;
+    };
+
+    // FFT vs direct DFT, n = 64, pseudo-random input.
+    {
+        const size_t n = 64;
+        slm::Fft fft(n);
+        std::vector<float> re(n), im(n), x(n);
+        unsigned seed = 12345;
+        for (size_t i = 0; i < n; ++i) {
+            seed = seed * 1103515245u + 12345u;
+            x[i] = re[i] = float((seed >> 8) % 2001) / 1000.0f - 1.0f;
+            im[i] = 0;
+        }
+        fft.run(re.data(), im.data());
+        double worst = 0;
+        for (size_t k = 0; k < n; ++k) {
+            double sr = 0, si = 0;
+            for (size_t i = 0; i < n; ++i) {
+                sr += x[i] * std::cos(2 * M_PI * double(k * i) / n);
+                si -= x[i] * std::sin(2 * M_PI * double(k * i) / n);
+            }
+            worst = std::fmax(worst, std::hypot(re[k] - sr, im[k] - si));
+        }
+        if (worst > 1e-4) fail("FFT differs from DFT by %g (limit %g)", worst, 1e-4);
+    }
+
+    const double fs = 48000;
+    slm::SpectrumAnalyzer sa(fs);
+    const size_t N = slm::SpectrumAnalyzer::kN;
+    const int B = slm::SpectrumAnalyzer::kBands;
+
+    // Band layout: inside the spectrum, in order, never empty.
+    for (int b = 0; b < B; ++b) {
+        if (sa.band_first_bin(b) < 1 || sa.band_end_bin(b) > N / 2 || sa.band_first_bin(b) >= sa.band_end_bin(b))
+            fail("band %g has bad bin range (first bin %g)", b, double(sa.band_first_bin(b)));
+        if (b > 0 && sa.band_first_bin(b) < sa.band_first_bin(b - 1))
+            fail("band %g starts before band %g", b, b - 1);
+    }
+
+    // Tones: the bands add up to the mean square, and the loudest band is the
+    // one containing the tone.
+    std::vector<float> x(N), out(B);
+    for (double f : {100.0, 1000.0, 5000.0}) {
+        const double amp = 0.1;
+        for (size_t i = 0; i < N; ++i) x[i] = float(amp * std::sin(2 * M_PI * f * double(i) / fs + 0.3));
+        sa.analyse(x.data(), out.data());
+        double total = 0;
+        int peak = 0;
+        for (int b = 0; b < B; ++b) {
+            total += out[b];
+            if (out[b] > out[peak]) peak = b;
+        }
+        const double want = amp * amp / 2;
+        const double err_db = 10 * std::log10(total / want);
+        const double df = fs / double(N);
+        const bool in_peak = f >= (sa.band_first_bin(peak) - 0.5) * df && f < (sa.band_end_bin(peak) + 0.5) * df;
+        std::printf("spectrum: %6.0f Hz tone -> band %2d (centre %7.1f Hz), total %+.2f dB vs mean square\n", f, peak,
+                    sa.band_centre(peak), err_db);
+        // Below ~250 Hz bands are narrower than a bin and share bins, so their
+        // sum double-counts; only check the total where bands are disjoint.
+        if (f >= 500 && std::fabs(err_db) > 0.2) fail("total power off by %g dB at %g Hz", err_db, f);
+        if (!in_peak) fail("loudest band centre %g Hz does not contain %g Hz", sa.band_centre(peak), f);
+    }
+    std::printf("spectrum: %s\n", fails ? "FAILED" : "ok");
+    return fails;
+}
+
+// Interference low-pass: flat passband, deep stopband from 14.5 kHz, and the
+// float implementation really removes a 14.8 kHz tone.
+static int check_lowpass()
+{
+    int fails = 0;
+    slm::ChebyLowpass lp(48000);
+    std::printf("\nlow-pass response:");
+    for (double f : {1000.0, 5000.0, 8000.0, 10000.0, 11000.0, 12000.0, 12500.0, 13000.0, 14000.0})
+        std::printf(" %.1fk:%+.2f", f / 1000, lp.response_db(f));
+    std::printf("\n");
+    auto need = [&](const char *what, bool ok) {
+        if (!ok) {
+            std::printf("low-pass: %s  << FAIL\n", what);
+            ++fails;
+        }
+    };
+    need("|gain| < 0.05 dB up to 8 kHz", std::fabs(lp.response_db(1000)) < 0.05 && std::fabs(lp.response_db(8000)) < 0.05);
+    need("loss < 0.2 dB at 10 kHz", lp.response_db(10000) > -0.2);
+    need("loss < 1 dB at 12 kHz", lp.response_db(12000) > -1.0);
+    double worst = -999;
+    for (double f = 14500; f < 23999; f += 25) worst = std::fmax(worst, lp.response_db(f));
+    std::printf("low-pass: worst stopband 14.5-24 kHz %.1f dB\n", worst);
+    need("stopband <= -49.5 dB from 14.5 kHz", worst <= -49.5);
+
+    // Float: 1 kHz passes, 14.8 kHz (the interference) is removed.
+    for (double f : {1000.0, 14824.0}) {
+        slm::ChebyLowpass p(48000);
+        double acc = 0;
+        const int n = 48000, settle = 4800;
+        for (int i = 0; i < n; ++i) {
+            const float y = p.process(float(0.5 * std::sin(2 * M_PI * f * i / 48000)));
+            if (i >= settle) acc += double(y) * y;
+        }
+        const double gain_db = 10 * std::log10(acc / (n - settle) / 0.125);
+        std::printf("low-pass: %.0f Hz sine through float filter: %+.2f dB\n", f, gain_db);
+        if (f < 2000) need("1 kHz passes in float", std::fabs(gain_db) < 0.05);
+        else need("14.8 kHz removed in float (< -45 dB)", gain_db < -45);
+    }
+    return fails;
+}
+
 int main()
 {
     int failures = 0;
+    failures += check_lowpass();
+    failures += check_spectrum();
     failures += check_rolling_leq();
     failures += check_battery();
-    failures += check_seg7();
+    failures += check_seg7(slm::Seg7Geometry{}, true);  // main reading (defaults)
+    {
+        slm::Seg7Geometry small;  // analyser screen corners, as in main.cpp
+        small.digit_w = 30; small.digit_h = 56; small.thick = 7; small.gap = 1;
+        small.spacing = 9; small.dp_w = 7; small.dp_spacing = 4;
+        failures += check_seg7(small, false);
+        slm::Seg7Geometry leq;  // main screen LAeq, as in main.cpp
+        leq.digit_w = 24; leq.digit_h = 44; leq.thick = 6; leq.gap = 1; leq.spacing = 7;
+        failures += check_seg7(leq, false);
+    }
     failures += check_orientation();
     failures += check_response(48000);
     failures += check_response(44100);

@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "esp_heap_caps.h"
 
 #include "bsp/display.h"
 #include "bsp/esp-bsp.h"
@@ -26,6 +27,8 @@
 #include "auto_rotate.hpp"
 #include "level_meter.hpp"
 #include "seg7_widget.hpp"
+#include "spectrum.hpp"
+#include "spectrum_view.hpp"
 #include "battery.hpp"
 
 namespace {
@@ -83,33 +86,106 @@ void save_calibration()
 float to_spl(float dbfs) { return dbfs - kMicGainDb + g_cal_offset; }
 
 // ---------------------------------------------------------------------------
+// Spectrum analyser data
+// ---------------------------------------------------------------------------
+using slm::SpectrumAnalyzer;
+constexpr size_t kSpecN = SpectrumAnalyzer::kN;
+constexpr int kSpecBands = SpectrumAnalyzer::kBands;
+constexpr uint32_t kSpecFrameMs = 40;   // 25 frames per second
+constexpr float kSpecMinDb = 20.0f;     // band level (dB SPL) at the centre line
+constexpr float kSpecMaxDb = 100.0f;    // band level (dB SPL) at full height
+
+std::atomic<bool> g_spec_on{false};     // spectrum screen visible
+std::mutex g_spec_mutex;
+// Latest samples, (L+R)/2, unweighted. In PSRAM (allocated in app_main):
+// internal RAM must stay free for the I2S and display DMA buffers.
+float *g_spec_ring = nullptr;
+size_t g_spec_head = 0;                 // next write position
+float g_spec_db[kSpecBands];            // band levels in dB SPL
+bool g_spec_fresh = false;
+
+// Analyser range: up to 13 kHz, the top of the interference low-pass's
+// passband (everything above is the board's own electrical noise).
+constexpr double kSpecLowHz = 50.0;
+constexpr double kSpecHighHz = 13000.0;
+
+// Audio task: append (L+R)/2, low-passed like the meter's input, to the ring
+// while the spectrum is shown.
+void spec_push(const float *l, const float *r, size_t n)
+{
+    static slm::ChebyLowpass lp(kSampleRate);
+    std::lock_guard<std::mutex> lock(g_spec_mutex);
+    for (size_t i = 0; i < n; ++i) {
+        g_spec_ring[g_spec_head] = lp.process(0.5f * (l[i] + r[i]));
+        g_spec_head = (g_spec_head + 1) % kSpecN;
+    }
+}
+
+void spectrum_task(void *)
+{
+    static SpectrumAnalyzer analyzer(kSampleRate, kSpecLowHz, kSpecHighHz);  // buffers are heap (PSRAM)
+    auto *frame = static_cast<float *>(heap_caps_malloc(kSpecN * sizeof(float), MALLOC_CAP_SPIRAM));
+    if (frame == nullptr) {
+        ESP_LOGE(TAG, "No PSRAM for spectrum frame; analyser disabled");
+        vTaskDelete(nullptr);
+        return;
+    }
+    float ms[kSpecBands];
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(kSpecFrameMs));
+        if (!g_spec_on) continue;
+        {
+            std::lock_guard<std::mutex> lock(g_spec_mutex);
+            // Oldest sample first.
+            const size_t tail = kSpecN - g_spec_head;
+            memcpy(frame, g_spec_ring + g_spec_head, tail * sizeof(float));
+            memcpy(frame + tail, g_spec_ring, g_spec_head * sizeof(float));
+        }
+        analyzer.analyse(frame, ms);
+        float db[kSpecBands];
+        for (int b = 0; b < kSpecBands; ++b) db[b] = to_spl(slm::LevelMeter::to_db(ms[b]));
+        std::lock_guard<std::mutex> lock(g_spec_mutex);
+        memcpy(g_spec_db, db, sizeof(db));
+        g_spec_fresh = true;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Audio task
 // ---------------------------------------------------------------------------
 int32_t s_raw[kBlockFrames * 2];
 float s_left[kBlockFrames];
 float s_right[kBlockFrames];
 
-void audio_task(void *)
+// Opens the ES7210 at 48 kHz / 32 bit / stereo. Called from app_main BEFORE
+// the display starts: the I2S driver needs internal DMA-capable RAM, and once
+// LVGL is drawing its first full frame there may not be enough left (that
+// caused a boot loop: "i2s_alloc_dma_desc: allocate DMA buffer failed",
+// then a crash inside esp_codec_dev_open).
+esp_codec_dev_handle_t open_microphones()
 {
     esp_codec_dev_handle_t mic = bsp_audio_codec_microphone_init();
     if (mic == nullptr) {
         ESP_LOGE(TAG, "ES7210 microphone init failed");
-        vTaskDelete(nullptr);
-        return;
+        return nullptr;
     }
-
     esp_codec_dev_sample_info_t fs = {};
     fs.sample_rate = kSampleRate;
     fs.channel = 2;           // MIC1 = left slot, MIC2 = right slot
     fs.bits_per_sample = 32;  // 24-bit ADC data, MSB-aligned in 32-bit slots
     if (esp_codec_dev_open(mic, &fs) != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "Failed to open microphone codec");
-        vTaskDelete(nullptr);
-        return;
+        return nullptr;
     }
     esp_codec_dev_set_in_gain(mic, kMicGainDb);
     ESP_LOGI(TAG, "Microphones running: %" PRIu32 " Hz, 2 ch, 32 bit, PGA %.1f dB",
              kSampleRate, kMicGainDb);
+    return mic;
+}
+
+void audio_task(void *arg)
+{
+    auto mic = static_cast<esp_codec_dev_handle_t>(arg);
     g_audio_ok = true;
 
     static slm::LevelMeter meter(kSampleRate);
@@ -129,6 +205,7 @@ void audio_task(void *)
 
         if (g_reset_request.exchange(false)) meter.reset_stats();
         meter.process(s_left, s_right, kBlockFrames);
+        if (g_spec_on && g_spec_ring) spec_push(s_left, s_right, kBlockFrames);
 
         const slm::Levels snap = meter.snapshot();
         {
@@ -150,12 +227,17 @@ void audio_task(void *)
 // UI
 // ---------------------------------------------------------------------------
 struct Ui {
+    lv_obj_t *main_view;   // sound level meter screen
+    lv_obj_t *spec_view;   // spectrum analyser screen
+    lv_obj_t *spec;
+    lv_obj_t *spec_dba;      // seven-segment, tap for Fast/Slow
+    lv_obj_t *spec_dba_cap;
+    lv_obj_t *spec_leq;      // seven-segment
     lv_obj_t *arc;
     lv_obj_t *value;
     lv_obj_t *mode;
     lv_obj_t *over;
     lv_obj_t *leq;
-    lv_obj_t *maxmin;
     lv_obj_t *cal_panel;
     lv_obj_t *cal_value;
     lv_obj_t *cal_live;
@@ -207,6 +289,12 @@ void fmt_seg7(char *buf, size_t n, float spl)
     else snprintf(buf, n, "i%2d", v);
 }
 
+// Sets a label's text only when it changes (avoids a redraw every update).
+void set_label(lv_obj_t *label, const char *text)
+{
+    if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
 void update_cal_label()
 {
     char buf[48];
@@ -241,13 +329,15 @@ void ui_timer_cb(lv_timer_t *)
 
     if (!g_audio_ok) {
         seg7_set_text(ui.value, "i--");
-        lv_label_set_text(ui.leq, "Microphone not available");
-        lv_label_set_text(ui.maxmin, "");
+        seg7_set_text(ui.leq, "i--");
+        set_label(ui.over, "NO MICROPHONE");
+        lv_obj_remove_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
         return;
     }
 
     const float main_db = to_spl(ui.slow ? l.las : l.laf);
-    char buf[128], a[16], b[16], c[16];
+    const float leq_db = to_spl(l.laeq);  // rolling 15-minute window
+    char buf[128], a[16], b[16];
 
     fmt_seg7(buf, sizeof(buf), main_db);
     seg7_set_text(ui.value, buf);
@@ -256,17 +346,24 @@ void ui_timer_cb(lv_timer_t *)
     lv_arc_set_value(ui.arc, (int32_t)lroundf(clamped * 10.0f));
     lv_obj_set_style_arc_color(ui.arc, level_colour(main_db), LV_PART_INDICATOR);
 
-    fmt_db(a, sizeof(a), to_spl(l.laeq));
-    snprintf(buf, sizeof(buf), "LAeq 15m %s", a);  // rolling 15-minute window
-    lv_label_set_text(ui.leq, buf);
+    // LAeq 15m: whole dB, same rounding as the main reading.
+    fmt_seg7(buf, sizeof(buf), leq_db);
+    seg7_set_text(ui.leq, buf);
 
-    fmt_db(b, sizeof(b), to_spl(l.lafmax));
-    fmt_db(c, sizeof(c), to_spl(l.lafmin));
-    snprintf(buf, sizeof(buf), "Max %s   Min %s", b, c);
-    lv_label_set_text(ui.maxmin, buf);
+    // Analyser screen corners: dB(A) and LAeq 15m, both in whole dB.
+    if (g_spec_on) {
+        fmt_seg7(buf, sizeof(buf), main_db);
+        seg7_set_text(ui.spec_dba, buf);
+        fmt_seg7(buf, sizeof(buf), leq_db);
+        seg7_set_text(ui.spec_leq, buf);
+    }
 
-    if (l.clipping) lv_obj_remove_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
-    else lv_obj_add_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
+    if (l.clipping) {
+        set_label(ui.over, "OVERLOAD");
+        lv_obj_remove_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (!lv_obj_has_flag(ui.cal_panel, LV_OBJ_FLAG_HIDDEN)) {
         fmt_db(a, sizeof(a), to_spl(l.las));
@@ -308,9 +405,106 @@ void on_toggle_mode(lv_event_t *)
 {
     ui.slow = !ui.slow;
     lv_label_set_text(ui.mode, ui.slow ? "dB(A)  SLOW" : "dB(A)  FAST");
+    lv_label_set_text(ui.spec_dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
 }
 
-void on_reset(lv_event_t *) { g_reset_request = true; }
+// ---------------------------------------------------------------------------
+// Analyser (spectrum) screen
+// ---------------------------------------------------------------------------
+void spec_timer_cb(lv_timer_t *)
+{
+    if (!g_spec_on) return;
+    float db[kSpecBands];
+    {
+        std::lock_guard<std::mutex> lock(g_spec_mutex);
+        if (!g_spec_fresh) return;
+        g_spec_fresh = false;
+        memcpy(db, g_spec_db, sizeof(db));
+    }
+    // dB -> 0..1, then square root as in Waveshare's demo so quieter bands
+    // still show a visible bar.
+    float level[kSpecBands];
+    for (int b = 0; b < kSpecBands; ++b) {
+        float v = (db[b] - kSpecMinDb) / (kSpecMaxDb - kSpecMinDb);
+        v = v < 0 ? 0 : (v > 1 ? 1 : v);
+        level[b] = sqrtf(v);
+    }
+    spectrum_view_set(ui.spec, level);
+}
+
+void show_spectrum(bool on)
+{
+    if (on) {
+        if (g_spec_ring == nullptr) return;  // analyser unavailable
+        {
+            std::lock_guard<std::mutex> lock(g_spec_mutex);
+            memset(g_spec_ring, 0, kSpecN * sizeof(float));  // no stale audio from last time
+            g_spec_fresh = false;
+        }
+        lv_obj_add_flag(ui.main_view, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(ui.spec_view, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ui.spec_view, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(ui.main_view, LV_OBJ_FLAG_HIDDEN);
+    }
+    g_spec_on = on;
+}
+
+void on_show_analyser(lv_event_t *) { show_spectrum(true); }
+void on_show_meter(lv_event_t *) { show_spectrum(false); }
+
+void build_spectrum_view(lv_obj_t *scr)
+{
+    lv_obj_t *v = lv_obj_create(scr);
+    ui.spec_view = v;
+    lv_obj_remove_style_all(v);
+    lv_obj_set_size(v, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_remove_flag(v, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(v, LV_OBJ_FLAG_CLICKABLE);
+
+    // 64 bars x 6 px = 384 px wide, 280 px tall (140 px each side of centre).
+    ui.spec = spectrum_view_create(v, 384, 280, kSpecBands);
+    lv_obj_align(ui.spec, LV_ALIGN_CENTER, 0, -50);
+
+    // Small seven-segment readouts for the bottom corners: 30 x 56 px digits.
+    // "I88" is 85 px wide.
+    slm::Seg7Geometry small;
+    small.digit_w = 30;
+    small.digit_h = 56;
+    small.thick = 7;
+    small.gap = 1;
+    small.spacing = 9;
+    small.dp_w = 7;
+    small.dp_spacing = 4;
+    const lv_color_t ghost = lv_color_hex(0x1C1C1C);
+
+    // Bottom-left: current dB(A). Tap to switch Fast / Slow (shared with the
+    // meter screen).
+    ui.spec_dba = seg7_create(v, small, "I88");
+    seg7_set_colors(ui.spec_dba, kColText, ghost);
+    seg7_set_text(ui.spec_dba, "i--");
+    lv_obj_align(ui.spec_dba, LV_ALIGN_BOTTOM_LEFT, 44, -66);
+    lv_obj_add_flag(ui.spec_dba, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ui.spec_dba, 24);
+    lv_obj_add_event_cb(ui.spec_dba, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
+    ui.spec_dba_cap = make_label(v, &lv_font_montserrat_16, kColDim, "dB(A) FAST");
+    lv_obj_align_to(ui.spec_dba_cap, ui.spec_dba, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 6);
+
+    // Bottom-right: LAeq over the last 15 minutes.
+    ui.spec_leq = seg7_create(v, small, "I88");
+    seg7_set_colors(ui.spec_leq, kColText, ghost);
+    seg7_set_text(ui.spec_leq, "i--");
+    lv_obj_align(ui.spec_leq, LV_ALIGN_BOTTOM_RIGHT, -44, -66);
+    lv_obj_t *cap_r = make_label(v, &lv_font_montserrat_16, kColDim, "LAeq 15m");
+    lv_obj_align_to(cap_r, ui.spec_leq, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 6);
+
+    // Bottom-centre, above the battery icon: back to the meter screen.
+    lv_obj_t *meter = make_button(v, "dB meter", 128, 52, on_show_meter, nullptr);
+    lv_obj_align(meter, LV_ALIGN_BOTTOM_MID, 0, -54);
+
+    lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_create(spec_timer_cb, kSpecFrameMs, nullptr);
+}
 
 void on_cal_open(lv_event_t *)
 {
@@ -392,8 +586,17 @@ void build_ui()
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    // Main (sound level meter) view: a transparent full-screen container so
+    // the user button can swap it with the spectrum view in one step.
+    lv_obj_t *mv = lv_obj_create(scr);
+    ui.main_view = mv;
+    lv_obj_remove_style_all(mv);
+    lv_obj_set_size(mv, BSP_LCD_H_RES, BSP_LCD_V_RES);
+    lv_obj_remove_flag(mv, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(mv, LV_OBJ_FLAG_CLICKABLE);
+
     // Gauge: 270 degree arc, opening at the bottom.
-    ui.arc = lv_arc_create(scr);
+    ui.arc = lv_arc_create(mv);
     lv_obj_set_size(ui.arc, 440, 440);
     lv_obj_center(ui.arc);
     lv_arc_set_rotation(ui.arc, 135);
@@ -413,36 +616,49 @@ void build_ui()
     lv_obj_align(hi, LV_ALIGN_CENTER, 140, 172);*/
 
     // Vertical layout, offsets from the screen centre (reading 100 px tall):
-    //   OVERLOAD -100 | reading -12 (-62..38) | mode 54 | LAeq 88 | Max/Min 114
-    //   | Reset/Cal buttons 160 | battery icon at the bottom edge
-    ui.over = make_label(scr, &lv_font_montserrat_24, kColRed, "OVERLOAD");
-    lv_obj_align(ui.over, LV_ALIGN_CENTER, 0, -100);
+    //   OVERLOAD -150 (-162..-138) | reading -60 (-110..-10) | mode 12 (0..24)
+    //   | LAeq digits 60 (38..82) | LAeq caption 96 (88..104)
+    //   | Analyser/Cal buttons 160 (134..186)
+    //   | battery icon at the bottom edge
+    ui.over = make_label(mv, &lv_font_montserrat_24, kColRed, "OVERLOAD");
+    lv_obj_align(ui.over, LV_ALIGN_CENTER, 0, -150);
     lv_obj_add_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
 
     // Big reading; tap it to switch Fast / Slow.
     // Seven-segment readout: narrow "1" cell for hundreds, then "88.8".
     slm::Seg7Geometry seg;  // defaults: 54 x 100 digits, 12 px segments
-    ui.value = seg7_create(scr, seg, "I88");
+    ui.value = seg7_create(mv, seg, "I88");
     seg7_set_colors(ui.value, kColText, lv_color_hex(0x1C1C1C));
     seg7_set_text(ui.value, "i--");
-    lv_obj_align(ui.value, LV_ALIGN_CENTER, 0, -12);
+    lv_obj_align(ui.value, LV_ALIGN_CENTER, 0, -60);
     lv_obj_add_flag(ui.value, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(ui.value, 30);
     lv_obj_add_event_cb(ui.value, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
 
-    ui.mode = make_label(scr, &lv_font_montserrat_24, kColDim, "dB(A)  FAST");
-    lv_obj_align(ui.mode, LV_ALIGN_CENTER, 0, 54);
+    ui.mode = make_label(mv, &lv_font_montserrat_24, kColDim, "dB(A)  FAST");
+    lv_obj_align(ui.mode, LV_ALIGN_CENTER, 0, 12);
 
-    ui.leq = make_label(scr, &lv_font_montserrat_20, kColText, "");
-    lv_obj_align(ui.leq, LV_ALIGN_CENTER, 0, 88);
+    // LAeq 15m: smaller seven-segment readout (24 x 44 px digits, "I88" is
+    // 68 px wide), centred, with its caption centred below.
+    slm::Seg7Geometry leq_geo;
+    leq_geo.digit_w = 24;
+    leq_geo.digit_h = 44;
+    leq_geo.thick = 6;
+    leq_geo.gap = 1;
+    leq_geo.spacing = 7;
+    ui.leq = seg7_create(mv, leq_geo, "I88");
+    seg7_set_colors(ui.leq, kColText, lv_color_hex(0x1C1C1C));
+    seg7_set_text(ui.leq, "i--");
+    lv_obj_align(ui.leq, LV_ALIGN_CENTER, 0, 60);
+    lv_obj_t *leq_cap = make_label(mv, &lv_font_montserrat_16, kColDim, "LAeq 15m");
+    lv_obj_align(leq_cap, LV_ALIGN_CENTER, 0, 96);
 
-    ui.maxmin = make_label(scr, &lv_font_montserrat_20, kColText, "");
-    lv_obj_align(ui.maxmin, LV_ALIGN_CENTER, 0, 114);
-
-    lv_obj_t *reset = make_button(scr, "Reset", 120, 52, on_reset, nullptr);
-    lv_obj_align(reset, LV_ALIGN_CENTER, -66, 160);
-    lv_obj_t *cal = make_button(scr, "Cal", 120, 52, on_cal_open, nullptr);
+    lv_obj_t *analyser = make_button(mv, "Analyser", 120, 52, on_show_analyser, nullptr);
+    lv_obj_align(analyser, LV_ALIGN_CENTER, -66, 160);
+    lv_obj_t *cal = make_button(mv, "Cal", 120, 52, on_cal_open, nullptr);
     lv_obj_align(cal, LV_ALIGN_CENTER, 66, 160);
+
+    build_spectrum_view(scr);
 
     // Battery icon, bottom centre in the gap of the arc, dimmed to 33 %
     // (opacity over the black background = brightness).
@@ -478,6 +694,11 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(err);
     load_calibration();
 
+    // Microphones first, while internal DMA RAM is still plentiful.
+    esp_codec_dev_handle_t mic = open_microphones();
+
+    g_spec_ring = static_cast<float *>(heap_caps_calloc(kSpecN, sizeof(float), MALLOC_CAP_SPIRAM));
+
     lv_display_t *disp = bsp_display_start();
     if (disp == nullptr) {
         ESP_LOGE(TAG, "Display init failed");
@@ -492,6 +713,10 @@ extern "C" void app_main(void)
     }
 
     // Audio on core 1 at high priority so I2S never overruns while LVGL renders.
-    xTaskCreatePinnedToCore(audio_task, "audio", 6 * 1024, nullptr, 10, nullptr, 1);
+    // Without microphones the UI keeps showing "Microphone not available".
+    if (mic) xTaskCreatePinnedToCore(audio_task, "audio", 6 * 1024, mic, 10, nullptr, 1);
+    // FFT runs only while the spectrum screen is shown (~2 ms per frame).
+    if (g_spec_ring) xTaskCreatePinnedToCore(spectrum_task, "spectrum", 4 * 1024, nullptr, 4, nullptr, 1);
+    else ESP_LOGE(TAG, "No PSRAM for spectrum buffer; analyser disabled");
     battery_start();
 }

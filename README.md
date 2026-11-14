@@ -11,8 +11,7 @@ levels on the 480×480 AMOLED.
 |---|---|
 | Big number | LAF (Fast, 125 ms) or LAS (Slow, 1 s). Tap the number to switch. |
 | Arc gauge | 30–130 dB(A). Green below 70, amber 70–85, red at 85 and above. |
-| LAeq 15m | Equivalent continuous level over the last 15 minutes (rolling). Until 15 minutes have passed since power-on or **Reset**, it covers the time so far. |
-| Max / Min | Max and min of LAF since the last **Reset**. |
+| LAeq 15m | Smaller 7-segment readout, in whole dB. Equivalent continuous level over the last 15 minutes (rolling). Until 15 minutes have passed since power-on, it covers the time so far. |
 | Mic 1 / Mic 2 | LAF of each capsule on its own. A large gap means one mic is blocked or faulty. |
 | OVERLOAD | Either mic hit ADC full scale in the last second, so the reading is not valid. |
 
@@ -32,6 +31,16 @@ levels on the 480×480 AMOLED.
   bilinear transform's large error near Nyquist. At 48 kHz the filter is within
   0.07 dB of the IEC 61672-1 curve from 10 Hz to 10 kHz, and within 0.54 dB at
   20 kHz.
+- **Interference low-pass** ([main/lowpass.hpp](main/lowpass.hpp)): the mic
+  signal on this board picks up electrical interference from the board itself,
+  at about 14.8 kHz with more near 15.8 and 17.4 kHz. Covering the mic ports
+  makes no difference, so it isn't sound. A 10th-order Chebyshev type II
+  low-pass runs before the A-weighting. It is flat to 11 kHz, −0.4 dB at
+  12.5 kHz, and at least 50 dB down from 14.5 kHz. Measured on the board, it
+  lowered the quiet-room reading from about 35 to 27.5 dB(A), and brought the
+  two mics from 6.5 dB apart to within 0.1 dB of each other. Sound above about
+  13 kHz is no longer measured, which takes the meter outside class 1
+  tolerance at 16 kHz.
 - **Two microphones**: the main reading uses the average of both capsules.
   Sound adds coherently across the two capsules but their self-noise does not,
   so averaging lowers the noise floor by about 3 dB. Each mic is also measured
@@ -62,6 +71,25 @@ Settings are under `idf.py menuconfig` → **Sound Level Meter**:
 |---|---|---|
 | `SLM_MIC_GAIN_DB` | 12 | ES7210 PGA gain. Lower it for very loud sources, raise it for quiet rooms. Calibration is stored relative to 0 dB gain, so you do not need to recalibrate after changing it. |
 | `SLM_CAL_OFFSET_X10` | 1350 | Default offset of 135.0 dB, used until you save a calibration on the device. |
+
+## Spectrum screen
+
+Tap **Analyser** on the meter screen to open the spectrum analyser. Tap
+**dB meter** (bottom centre, above the battery icon) to go back.
+
+- 64 bars on a log frequency scale from 50 Hz to 13 kHz (the interference
+  low-pass removes everything above), taken from the
+  average of both mics. Bars are mirrored about a centre line and coloured red
+  to violet, with falling peak markers, in the style of Waveshare's
+  `05_Spec_Analyzer` demo.
+- The bars show unweighted levels per band in dB SPL, using the same
+  calibration as the meter. The centre line is 20 dB and full height is
+  100 dB, with a square-root scale as in the demo.
+- Bottom left shows the current dB(A) on a 7-segment readout. Tap it to
+  switch between Fast and Slow; the setting is shared with the meter screen.
+  Bottom right shows LAeq 15m, also on a 7-segment readout.
+- 4096-point FFT (85 ms window, 11.7 Hz bins), refreshed 25 times a second.
+  It only runs while the spectrum screen is showing.
 
 ## Auto-rotation
 
@@ -106,8 +134,9 @@ Formula: `dB SPL = dBFS(RMS) − PGA gain + offset`.
   acoustic ports. Their frequency response, and the small enclosure, affect the
   result more than the filter does. Expect roughly ±1–2 dB accuracy on broadband
   noise after calibration. This is **not a certified IEC 61672 instrument**.
-- The noise floor is set by the capsules' self-noise, typically about
-  30–35 dB(A), so very quiet rooms read high.
+- The noise floor is set by the capsules' self-noise. Measured on this board,
+  it is about 27–28 dB(A) with the default calibration, so very quiet rooms
+  read high.
 - The upper limit depends on the PGA gain. Watch for the OVERLOAD indicator.
 
 ## Host tests
