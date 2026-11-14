@@ -144,6 +144,8 @@ public:
     // and the A-weighted mean square of the latest one. Used for the history.
     uint64_t seconds_done() const { return seconds_done_; }
     double last_second_ms() const { return last_second_ms_; }
+    // Rolling LAeq as a mean square, over the whole seconds in the window.
+    double laeq_ms() const { return ring_count_ ? ring_sum_ / double(ring_count_) : 0.0; }
 
 private:
     static constexpr float kClipLevel = 0.999f;

@@ -16,10 +16,13 @@ constexpr float kMinColourSpanDb = 6.0f;  // levels closer than this don't use t
 const lv_color_t kGrid = lv_color_hex(0x262626);
 const lv_color_t kBase = lv_color_hex(0x404040);
 const lv_color_t kLabel = lv_color_hex(0x8A8A8A);
+const lv_color_t kLeqMark = lv_color_hex(0xA0A0A0);
+constexpr int32_t kLeqH = 2;          // LAeq mark thickness
 
 struct HistState {
     int bars;
-    std::vector<float> db;  // oldest first
+    std::vector<float> db;   // oldest first
+    std::vector<float> leq;  // LAeq 15m at each point
     int count = 0;
 };
 
@@ -62,10 +65,16 @@ void draw_cb(lv_event_t *e)
         if (i == 0 || v > mx) mx = v;
     }
     if (st->count == 0) mn = mx = 40.0f;
+    // The scale also fits the LAeq marks; the colours use the bars only.
+    float smn = mn, smx = mx;
+    for (int i = 0; i < st->count; ++i) {
+        if (st->leq[i] < smn) smn = st->leq[i];
+        if (st->leq[i] > smx) smx = st->leq[i];
+    }
 
     // Vertical scale: whole tens with a little headroom, at least 30 dB.
-    float lo = std::floor((mn - 3.0f) / 10.0f) * 10.0f;
-    float hi = std::ceil((mx + 3.0f) / 10.0f) * 10.0f;
+    float lo = std::floor((smn - 3.0f) / 10.0f) * 10.0f;
+    float hi = std::ceil((smx + 3.0f) / 10.0f) * 10.0f;
     if (lo < 0) lo = 0;
     if (hi - lo < kMinSpanDb) hi = lo + kMinSpanDb;
     const float step = hi - lo > 60.0f ? 20.0f : 10.0f;
@@ -104,6 +113,16 @@ void draw_cb(lv_event_t *e)
         const lv_color_t col = lv_color_hsv_to_rgb((uint16_t)lroundf(270.0f * (1.0f - t)), 100, 100);
         fill(layer, col, xa, bottom - bh + 1, xb, bottom);
     }
+
+    // LAeq marks over the bars, spanning the gaps too so they read as a line.
+    for (int i = 0; i < st->count; ++i) {
+        const int slot = st->bars - st->count + i;
+        const int32_t xa = x_end - (st->bars - slot) * pitch;
+        int32_t lh = (int32_t)lroundf((st->leq[i] - lo) * px_per_db);
+        if (lh < kLeqH) lh = kLeqH;
+        if (lh > bottom - top) lh = bottom - top;
+        fill(layer, kLeqMark, xa, bottom - lh + 1, xa + pitch - 1, bottom - lh + kLeqH);
+    }
 }
 
 void delete_cb(lv_event_t *e) { delete static_cast<HistState *>(lv_event_get_user_data(e)); }
@@ -115,6 +134,7 @@ lv_obj_t *history_view_create(lv_obj_t *parent, int32_t w, int32_t h, int bars)
     auto *st = new HistState;
     st->bars = bars;
     st->db.assign(bars, 0.0f);
+    st->leq.assign(bars, 0.0f);
 
     lv_obj_t *obj = lv_obj_create(parent);
     lv_obj_remove_style_all(obj);
@@ -127,14 +147,18 @@ lv_obj_t *history_view_create(lv_obj_t *parent, int32_t w, int32_t h, int bars)
     return obj;
 }
 
-void history_view_set(lv_obj_t *obj, const float *db, int count)
+void history_view_set(lv_obj_t *obj, const float *db, const float *leq_db, int count)
 {
     auto *st = static_cast<HistState *>(lv_obj_get_user_data(obj));
     if (count > st->bars) {
         db += count - st->bars;
+        leq_db += count - st->bars;
         count = st->bars;
     }
-    for (int i = 0; i < count; ++i) st->db[i] = db[i];
+    for (int i = 0; i < count; ++i) {
+        st->db[i] = db[i];
+        st->leq[i] = leq_db[i];
+    }
     st->count = count;
     lv_obj_invalidate(obj);
 }

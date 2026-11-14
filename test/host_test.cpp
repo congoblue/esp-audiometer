@@ -542,6 +542,20 @@ static int check_history()
     g.push_second(1.0);
     need("version moves", g.version() != v);
 
+    // LAeq marks: each bar keeps the LAeq passed with its latest second.
+    slm::LevelHistory q(90, 10);
+    for (int s = 0; s < 25; ++s) q.push_second(1.0, 100.0 + s);
+    std::vector<double> leq(90);
+    n = q.copy(out.data(), leq.data());
+    need("LAeq per bar", n == 3 && leq[0] == 109.0 && leq[1] == 119.0 && leq[2] == 124.0);
+
+    // Meter LAeq mean square matches its snapshot.
+    slm::LevelMeter lm(8000);
+    std::vector<float> y(8000 * 4, 0.1f);
+    lm.process(y.data(), y.data(), y.size());
+    need("meter laeq_ms matches snapshot",
+         std::fabs(slm::LevelMeter::to_db(float(lm.laeq_ms())) - lm.snapshot().laeq) < 0.5f);
+
     // LevelMeter hands over each second exactly once.
     slm::LevelMeter m(8000);
     std::vector<float> x(8000 * 3, 0.1f);

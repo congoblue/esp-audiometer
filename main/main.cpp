@@ -260,7 +260,7 @@ void audio_task(void *arg)
         if (meter.seconds_done() != seconds_seen) {  // a second finished in this block
             seconds_seen = meter.seconds_done();
             std::lock_guard<std::mutex> lock(g_hist_mutex);
-            g_history.push_second(meter.last_second_ms());
+            g_history.push_second(meter.last_second_ms(), meter.laeq_ms());
         }
 
         const slm::Levels snap = meter.snapshot();
@@ -395,17 +395,20 @@ void update_power_overlay()
 // Redraws the history graph when a new second has been added.
 void update_history()
 {
-    double ms[kHistBars];
+    double ms[kHistBars], leq_ms[kHistBars];
     size_t n;
     {
         std::lock_guard<std::mutex> lock(g_hist_mutex);
         if (g_history.version() == ui.hist_version) return;
         ui.hist_version = g_history.version();
-        n = g_history.copy(ms);
+        n = g_history.copy(ms, leq_ms);
     }
-    float db[kHistBars];
-    for (size_t i = 0; i < n; ++i) db[i] = to_spl(slm::LevelMeter::to_db((float)ms[i]));
-    history_view_set(ui.hist, db, (int)n);
+    float db[kHistBars], leq_db[kHistBars];
+    for (size_t i = 0; i < n; ++i) {
+        db[i] = to_spl(slm::LevelMeter::to_db((float)ms[i]));
+        leq_db[i] = to_spl(slm::LevelMeter::to_db((float)leq_ms[i]));
+    }
+    history_view_set(ui.hist, db, leq_db, (int)n);
 }
 
 void ui_timer_cb(lv_timer_t *)

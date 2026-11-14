@@ -114,6 +114,8 @@ A rolling bar graph of dB(A) over the last 15 minutes
 - Colours are relative to what is on screen: the quietest bar is violet and
   the loudest red. When all the levels are within 6 dB of each other, the
   colours stay at the violet end, so small changes don't look dramatic.
+- A grey mark on each bar shows what LAeq 15m was at that time, so the marks
+  form a line showing how the 15-minute average has moved.
 
 ## Waterfall screen
 
