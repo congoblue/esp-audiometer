@@ -31,6 +31,7 @@
 #include "seg7_widget.hpp"
 #include "spectrum.hpp"
 #include "spectrum_view.hpp"
+#include "waterfall_view.hpp"
 #include "battery.hpp"
 
 namespace {
@@ -106,7 +107,7 @@ constexpr uint32_t kSpecFrameMs = 40;   // 25 frames per second
 constexpr float kSpecMinDb = 20.0f;     // band level (dB SPL) at the baseline
 constexpr float kSpecMaxDb = 100.0f;    // band level (dB SPL) at full height
 
-std::atomic<bool> g_spec_on{false};     // spectrum screen visible
+std::atomic<bool> g_spec_on{false};     // analyser or waterfall screen visible
 std::mutex g_spec_mutex;
 // Latest samples, (L+R)/2, unweighted. In PSRAM (allocated in app_main):
 // internal RAM must stay free for the I2S and display DMA buffers.
@@ -114,6 +115,14 @@ float *g_spec_ring = nullptr;
 size_t g_spec_head = 0;                 // next write position
 float g_spec_db[kSpecBands];            // band levels in dB SPL
 bool g_spec_fresh = false;
+
+// Waterfall: one row every 0.25 s, each the energy average of the FFT frames
+// in that time (about 6). Shares g_spec_mutex.
+constexpr uint32_t kWfRowMs = 100;
+constexpr int32_t kWfRowPx = 2;         // 300 px tall -> 150 rows = 25 s
+float g_wf_db[kSpecBands];              // latest row, dB SPL
+bool g_wf_fresh = false;
+std::atomic<bool> g_wf_restart{false};  // start a new row from scratch
 
 // Analyser range: up to 13 kHz, the top of the interference low-pass's
 // passband (everything above is the board's own electrical noise).
@@ -142,6 +151,9 @@ void spectrum_task(void *)
         return;
     }
     float ms[kSpecBands];
+    double wf_acc[kSpecBands] = {};  // waterfall row being averaged
+    int wf_frames = 0;
+    TickType_t wf_start = xTaskGetTickCount();
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(kSpecFrameMs));
         if (!g_spec_on) continue;
@@ -155,9 +167,36 @@ void spectrum_task(void *)
         analyzer.analyse(frame, ms);
         float db[kSpecBands];
         for (int b = 0; b < kSpecBands; ++b) db[b] = to_spl(slm::LevelMeter::to_db(ms[b]));
+
+        // Waterfall row: average the frames of each 0.25 s.
+        const TickType_t now = xTaskGetTickCount();
+        if (g_wf_restart.exchange(false)) {
+            memset(wf_acc, 0, sizeof(wf_acc));
+            wf_frames = 0;
+            wf_start = now;
+        }
+        for (int b = 0; b < kSpecBands; ++b) wf_acc[b] += ms[b];
+        ++wf_frames;
+        bool wf_row = false;
+        float wf_db[kSpecBands];
+        if (now - wf_start >= pdMS_TO_TICKS(kWfRowMs)) {
+            for (int b = 0; b < kSpecBands; ++b) {
+                wf_db[b] = to_spl(slm::LevelMeter::to_db(float(wf_acc[b] / wf_frames)));
+                wf_acc[b] = 0;
+            }
+            wf_frames = 0;
+            wf_start += pdMS_TO_TICKS(kWfRowMs);
+            if (now - wf_start >= pdMS_TO_TICKS(kWfRowMs)) wf_start = now;  // fell behind: resync
+            wf_row = true;
+        }
+
         std::lock_guard<std::mutex> lock(g_spec_mutex);
         memcpy(g_spec_db, db, sizeof(db));
         g_spec_fresh = true;
+        if (wf_row) {
+            memcpy(g_wf_db, wf_db, sizeof(wf_db));
+            g_wf_fresh = true;
+        }
     }
 }
 
@@ -244,8 +283,9 @@ void audio_task(void *arg)
 // UI
 // ---------------------------------------------------------------------------
 // The bottom button on each screen moves to the next: meter -> analyser ->
-// history -> meter.
-enum class Screen { Meter, Analyser, History };
+// history -> waterfall -> meter.
+enum class Screen { Meter, Analyser, History, Waterfall };
+constexpr int kScreens = 4;
 
 // dB(A) (tap for Fast/Slow) and LAeq 15m readouts in the bottom corners of
 // the analyser and history screens.
@@ -265,6 +305,9 @@ struct Ui {
     lv_obj_t *hist;
     CornerReadouts hist_corners;
     uint32_t hist_version = UINT32_MAX;  // history version last drawn
+    lv_obj_t *wf_view;     // waterfall screen
+    lv_obj_t *wf;          // canvas; nullptr if no PSRAM for it
+    CornerReadouts wf_corners;
     lv_obj_t *arc;
     lv_obj_t *value;
     lv_obj_t *mode;
@@ -398,9 +441,12 @@ void ui_timer_cb(lv_timer_t *)
     fmt_seg7(buf, sizeof(buf), leq_db);
     seg7_set_text(ui.leq, buf);
 
-    // Analyser / history screen corners: dB(A) and LAeq 15m, in whole dB.
+    // Analyser / history / waterfall screen corners: dB(A) and LAeq 15m, in
+    // whole dB.
     if (ui.screen != Screen::Meter) {
-        const CornerReadouts &c = ui.screen == Screen::Analyser ? ui.spec_corners : ui.hist_corners;
+        const CornerReadouts &c = ui.screen == Screen::Analyser ? ui.spec_corners
+                                  : ui.screen == Screen::History ? ui.hist_corners
+                                                                 : ui.wf_corners;
         fmt_seg7(buf, sizeof(buf), main_db);
         seg7_set_text(c.dba, buf);
         fmt_seg7(buf, sizeof(buf), leq_db);
@@ -457,49 +503,71 @@ void on_toggle_mode(lv_event_t *)
     lv_label_set_text(ui.mode, ui.slow ? "dB(A)  SLOW" : "dB(A)  FAST");
     lv_label_set_text(ui.spec_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
     lv_label_set_text(ui.hist_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
+    lv_label_set_text(ui.wf_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
 }
 
 // ---------------------------------------------------------------------------
 // Analyser (spectrum) screen
 // ---------------------------------------------------------------------------
-void spec_timer_cb(lv_timer_t *)
+// Band dB SPL -> 0..1 for display, then square root as in Waveshare's demo
+// so quieter bands still show. Used by the analyser and the waterfall.
+void spec_levels01(const float *db, float *level)
 {
-    if (!g_spec_on) return;
-    float db[kSpecBands];
-    {
-        std::lock_guard<std::mutex> lock(g_spec_mutex);
-        if (!g_spec_fresh) return;
-        g_spec_fresh = false;
-        memcpy(db, g_spec_db, sizeof(db));
-    }
-    // dB -> 0..1, then square root as in Waveshare's demo so quieter bands
-    // still show a visible bar.
-    float level[kSpecBands];
     for (int b = 0; b < kSpecBands; ++b) {
         float v = (db[b] - kSpecMinDb) / (kSpecMaxDb - kSpecMinDb);
         v = v < 0 ? 0 : (v > 1 ? 1 : v);
         level[b] = sqrtf(v);
     }
-    spectrum_view_set(ui.spec, level);
+}
+
+void spec_timer_cb(lv_timer_t *)
+{
+    if (!g_spec_on) return;
+    float db[kSpecBands], level[kSpecBands];
+    if (ui.screen == Screen::Analyser) {
+        {
+            std::lock_guard<std::mutex> lock(g_spec_mutex);
+            if (!g_spec_fresh) return;
+            g_spec_fresh = false;
+            memcpy(db, g_spec_db, sizeof(db));
+        }
+        spec_levels01(db, level);
+        spectrum_view_set(ui.spec, level);
+    } else if (ui.screen == Screen::Waterfall && ui.wf) {
+        {
+            std::lock_guard<std::mutex> lock(g_spec_mutex);
+            if (!g_wf_fresh) return;
+            g_wf_fresh = false;
+            memcpy(db, g_wf_db, sizeof(db));
+        }
+        spec_levels01(db, level);
+        waterfall_view_push(ui.wf, level);
+    }
 }
 
 void show_screen(Screen next)
 {
-    if (next == Screen::Analyser) {
-        if (g_spec_ring == nullptr) {
-            next = Screen::History;  // analyser unavailable
-        } else {
-            std::lock_guard<std::mutex> lock(g_spec_mutex);
-            memset(g_spec_ring, 0, kSpecN * sizeof(float));  // no stale audio from last time
-            g_spec_fresh = false;
-        }
+    // Screens that need the FFT are skipped if its buffer couldn't be allocated.
+    if (next == Screen::Analyser && g_spec_ring == nullptr) next = Screen::History;
+    if (next == Screen::Waterfall && (g_spec_ring == nullptr || ui.wf == nullptr)) next = Screen::Meter;
+
+    const bool spec = next == Screen::Analyser || next == Screen::Waterfall;
+    if (spec) {
+        std::lock_guard<std::mutex> lock(g_spec_mutex);
+        memset(g_spec_ring, 0, kSpecN * sizeof(float));  // no stale audio from last time
+        g_spec_fresh = false;
+        g_wf_fresh = false;
+    }
+    if (next == Screen::Waterfall) {
+        waterfall_view_clear(ui.wf);
+        g_wf_restart = true;
     }
     if (next == Screen::History) ui.hist_version = UINT32_MAX;  // redraw on the next update
 
     ui.screen = next;
-    g_spec_on = next == Screen::Analyser;
-    lv_obj_t *const views[] = {ui.main_view, ui.spec_view, ui.hist_view};
-    for (int i = 0; i < 3; ++i) {
+    g_spec_on = spec;
+    lv_obj_t *const views[kScreens] = {ui.main_view, ui.spec_view, ui.hist_view, ui.wf_view};
+    for (int i = 0; i < kScreens; ++i) {
         if (i == (int)next) lv_obj_remove_flag(views[i], LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(views[i], LV_OBJ_FLAG_HIDDEN);
     }
@@ -582,7 +650,39 @@ void build_history_view(lv_obj_t *scr)
     ui.hist = history_view_create(v, 400, 300, kHistBars);
     lv_obj_align(ui.hist, LV_ALIGN_TOP_MID, 0, 40);
 
-    build_corners(v, ui.hist_corners, "dB meter", Screen::Meter);
+    build_corners(v, ui.hist_corners, "Waterfall", Screen::Waterfall);
+
+    lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
+}
+
+void build_waterfall_view(lv_obj_t *scr)
+{
+    lv_obj_t *v = make_view(scr);
+    ui.wf_view = v;
+
+    // Same position and size as the analyser: 64 bands x 6 px = 384 px wide,
+    // 300 px tall, bottom edge just above the corner readouts.
+    constexpr int32_t kW = 384, kH = 300, kTop = 40;
+    ui.wf = waterfall_view_create(v, kW, kH, kSpecBands, kWfRowPx);
+    if (ui.wf) {
+        lv_obj_align(ui.wf, LV_ALIGN_TOP_MID, 0, kTop);
+    } else {
+        ESP_LOGE(TAG, "No PSRAM for the waterfall; screen disabled");
+    }
+
+    // Frequency marks above the waterfall. The bands are log-spaced from
+    // kSpecLowHz to kSpecHighHz, so f sits at log(f/low)/log(high/low) of the width.
+    struct Mark { double hz; const char *text; };
+    const Mark marks[] = {{100, "100"}, {1000, "1k"}, {10000, "10k"}};
+    for (const Mark &m : marks) {
+        const int32_t x = (int32_t)lround(kW * log(m.hz / kSpecLowHz) / log(kSpecHighHz / kSpecLowHz));
+        lv_obj_t *l = make_label(v, &lv_font_montserrat_16, kColDim, m.text);
+        lv_obj_set_width(l, 50);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(l, LV_ALIGN_TOP_LEFT, (BSP_LCD_H_RES - kW) / 2 + x - 25, kTop - 22);
+    }
+
+    build_corners(v, ui.wf_corners, "dB meter", Screen::Meter);
 
     lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
 }
@@ -737,6 +837,7 @@ void build_ui()
 
     build_spectrum_view(scr);
     build_history_view(scr);
+    build_waterfall_view(scr);
 
     // Battery icon, bottom centre in the gap of the arc, dimmed to 33 %
     // (opacity over the black background = brightness).

@@ -74,15 +74,15 @@ Settings are under `idf.py menuconfig` → **Sound Level Meter**:
 
 ## Screens
 
-There are three screens. The button at the bottom centre (above the battery
+There are four screens. The button at the bottom centre (above the battery
 icon) moves to the next one in turn:
 
-**dB meter** → **Analyser** → **History** → **dB meter**
+**dB meter** → **Analyser** → **History** → **Waterfall** → **dB meter**
 
-On the meter screen the button is **Analyser**, next to **Cal**. The analyser
-and history screens both show the current dB(A) bottom left and LAeq 15m
-bottom right, on 7-segment readouts. Tap the dB(A) readout to switch between
-Fast and Slow; the setting is shared by all three screens.
+On the meter screen the button is **Analyser**, next to **Cal**. The other
+three screens all show the current dB(A) bottom left and LAeq 15m bottom
+right, on 7-segment readouts. Tap the dB(A) readout to switch between Fast
+and Slow; the setting is shared by all the screens.
 
 ## Spectrum screen
 
@@ -96,7 +96,7 @@ Fast and Slow; the setting is shared by all three screens.
   calibration as the meter. The zero dots are 20 dB and full height is
   100 dB, with a square-root scale as in the demo.
 - 4096-point FFT (85 ms window, 11.7 Hz bins), refreshed 25 times a second.
-  It only runs while the spectrum screen is showing.
+  It only runs while the analyser or waterfall screen is showing.
 
 ## History screen
 
@@ -114,6 +114,20 @@ A rolling bar graph of dB(A) over the last 15 minutes
 - Colours are relative to what is on screen: the quietest bar is violet and
   the loudest red. When all the levels are within 6 dB of each other, the
   colours stay at the violet end, so small changes don't look dramatic.
+
+## Waterfall screen
+
+The spectrum over time ([main/waterfall_view.cpp](main/waterfall_view.cpp)).
+
+- Every 0.25 s a new line is drawn at the top and the older lines move down.
+  The screen holds 100 lines, so it shows the last 25 seconds.
+- Each line has the same 64 bands as the analyser (50 Hz on the left to
+  13 kHz on the right, marked at 100, 1k and 10k) with the same
+  calibration and level scale. Each line is the energy average of the FFT
+  frames in its quarter second.
+- Louder is brighter: black → blue → purple → red → yellow → white.
+- It starts empty each time you open the screen, because the FFT only runs
+  while the analyser or waterfall is showing.
 
 ## Auto-rotation
 
