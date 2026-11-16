@@ -32,6 +32,7 @@
 #include "spectrum.hpp"
 #include "spectrum_view.hpp"
 #include "waterfall_view.hpp"
+#include "ppm_view.hpp"
 #include "battery.hpp"
 
 namespace {
@@ -41,6 +42,13 @@ const char *TAG = "slm";
 constexpr uint32_t kSampleRate = 48000;
 constexpr size_t kBlockFrames = 480;  // 10 ms per read
 constexpr float kMicGainDb = CONFIG_SLM_MIC_GAIN_DB;
+
+// PPM screen: steady level (dB SPL, unweighted) that reads mark 4.
+#ifndef CONFIG_SLM_PPM_ALIGN_DB
+#define CONFIG_SLM_PPM_ALIGN_DB 64  // stale sdkconfig
+#endif
+constexpr float kPpmAlignDb = CONFIG_SLM_PPM_ALIGN_DB;
+constexpr uint32_t kPpmFrameMs = 40;  // needle update, 25 per second
 
 // Display range of the arc gauge (dB SPL).
 constexpr float kArcMinDb = 30.0f;
@@ -116,10 +124,10 @@ size_t g_spec_head = 0;                 // next write position
 float g_spec_db[kSpecBands];            // band levels in dB SPL
 bool g_spec_fresh = false;
 
-// Waterfall: one row every 0.25 s, each the energy average of the FFT frames
-// in that time (about 6). Shares g_spec_mutex.
+// Waterfall: one row every 0.1 s, each the energy average of the FFT frames
+// in that time (2 or 3). Shares g_spec_mutex.
 constexpr uint32_t kWfRowMs = 100;
-constexpr int32_t kWfRowPx = 2;         // 300 px tall -> 150 rows = 25 s
+constexpr int32_t kWfRowPx = 2;         // 270 px tall -> 135 rows = 13.5 s
 float g_wf_db[kSpecBands];              // latest row, dB SPL
 bool g_wf_fresh = false;
 std::atomic<bool> g_wf_restart{false};  // start a new row from scratch
@@ -168,7 +176,7 @@ void spectrum_task(void *)
         float db[kSpecBands];
         for (int b = 0; b < kSpecBands; ++b) db[b] = to_spl(slm::LevelMeter::to_db(ms[b]));
 
-        // Waterfall row: average the frames of each 0.25 s.
+        // Waterfall row: average the frames of each kWfRowMs.
         const TickType_t now = xTaskGetTickCount();
         if (g_wf_restart.exchange(false)) {
             memset(wf_acc, 0, sizeof(wf_acc));
@@ -284,8 +292,8 @@ void audio_task(void *arg)
 // ---------------------------------------------------------------------------
 // The bottom button on each screen moves to the next: meter -> analyser ->
 // history -> waterfall -> meter.
-enum class Screen { Meter, Analyser, History, Waterfall };
-constexpr int kScreens = 4;
+enum class Screen { Meter, Analyser, History, Waterfall, Ppm };
+constexpr int kScreens = 5;
 
 // dB(A) (tap for Fast/Slow) and LAeq 15m readouts in the bottom corners of
 // the analyser and history screens.
@@ -308,6 +316,13 @@ struct Ui {
     lv_obj_t *wf_view;     // waterfall screen
     lv_obj_t *wf;          // canvas; nullptr if no PSRAM for it
     CornerReadouts wf_corners;
+    lv_obj_t *ppm_view;    // PPM screen
+    lv_obj_t *ppm;         // dial
+    lv_obj_t *ppm_value;   // seven-segment dB(A), tap for Fast/Slow
+    lv_obj_t *ppm_mode;
+    lv_obj_t *ppm_leq;     // seven-segment
+    lv_obj_t *ppm_scale;   // "PPM  BBC" / "PPM  EBU", tap to switch
+    lv_obj_t *screen_name; // bottom centre, above the battery icon
     lv_obj_t *arc;
     lv_obj_t *value;
     lv_obj_t *mode;
@@ -444,9 +459,16 @@ void ui_timer_cb(lv_timer_t *)
     fmt_seg7(buf, sizeof(buf), leq_db);
     seg7_set_text(ui.leq, buf);
 
+    if (ui.screen == Screen::Ppm) {
+        fmt_seg7(buf, sizeof(buf), main_db);
+        seg7_set_text(ui.ppm_value, buf);
+        fmt_seg7(buf, sizeof(buf), leq_db);
+        seg7_set_text(ui.ppm_leq, buf);
+    }
+
     // Analyser / history / waterfall screen corners: dB(A) and LAeq 15m, in
     // whole dB.
-    if (ui.screen != Screen::Meter) {
+    if (ui.screen != Screen::Meter && ui.screen != Screen::Ppm) {
         const CornerReadouts &c = ui.screen == Screen::Analyser ? ui.spec_corners
                                   : ui.screen == Screen::History ? ui.hist_corners
                                                                  : ui.wf_corners;
@@ -507,6 +529,7 @@ void on_toggle_mode(lv_event_t *)
     lv_label_set_text(ui.spec_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
     lv_label_set_text(ui.hist_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
     lv_label_set_text(ui.wf_corners.dba_cap, ui.slow ? "dB(A) SLOW" : "dB(A) FAST");
+    lv_label_set_text(ui.ppm_mode, ui.slow ? "dB(A)  SLOW" : "dB(A)  FAST");
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +575,7 @@ void show_screen(Screen next)
 {
     // Screens that need the FFT are skipped if its buffer couldn't be allocated.
     if (next == Screen::Analyser && g_spec_ring == nullptr) next = Screen::History;
-    if (next == Screen::Waterfall && (g_spec_ring == nullptr || ui.wf == nullptr)) next = Screen::Meter;
+    if (next == Screen::Waterfall && (g_spec_ring == nullptr || ui.wf == nullptr)) next = Screen::Ppm;
 
     const bool spec = next == Screen::Analyser || next == Screen::Waterfall;
     if (spec) {
@@ -569,14 +592,17 @@ void show_screen(Screen next)
 
     ui.screen = next;
     g_spec_on = spec;
-    lv_obj_t *const views[kScreens] = {ui.main_view, ui.spec_view, ui.hist_view, ui.wf_view};
+    lv_obj_t *const views[kScreens] = {ui.main_view, ui.spec_view, ui.hist_view, ui.wf_view, ui.ppm_view};
     for (int i = 0; i < kScreens; ++i) {
         if (i == (int)next) lv_obj_remove_flag(views[i], LV_OBJ_FLAG_HIDDEN);
         else lv_obj_add_flag(views[i], LV_OBJ_FLAG_HIDDEN);
     }
+    static const char *const kNames[kScreens] = {"dB Meter", "Spectrum", "History", "Waterfall", "PPM"};
+    lv_label_set_text(ui.screen_name, kNames[(int)next]);
 }
 
-void on_show_screen(lv_event_t *e) { show_screen((Screen)(intptr_t)lv_event_get_user_data(e)); }
+// Mode button: the next screen in the cycle.
+void on_mode(lv_event_t *) { show_screen((Screen)(((int)ui.screen + 1) % kScreens)); }
 
 // Full-screen container for one screen.
 lv_obj_t *make_view(lv_obj_t *scr)
@@ -589,11 +615,16 @@ lv_obj_t *make_view(lv_obj_t *scr)
     return v;
 }
 
-// Bottom corners: dB(A) on the left (tap for Fast / Slow, shared with the
-// meter screen), LAeq 15m on the right, as small seven-segment readouts with
-// captions below. Bottom centre, above the battery icon: the button to the
-// next screen.
-void build_corners(lv_obj_t *v, CornerReadouts &c, const char *next_text, Screen next)
+// Graph area on the analyser, history and waterfall screens: y = 40..310.
+// Below it, from y = 322, the corner readouts and their captions (to
+// y = 402), then the bottom bar (screen name, Mode and setup buttons).
+constexpr int32_t kGraphTop = 40;
+constexpr int32_t kGraphH = 270;
+
+// Corners above the bottom bar: dB(A) on the left (tap for Fast / Slow,
+// shared with the meter screen), LAeq 15m on the right, as small
+// seven-segment readouts with captions below.
+void build_corners(lv_obj_t *v, CornerReadouts &c)
 {
     // 30 x 56 px digits; "I88" is 85 px wide.
     slm::Seg7Geometry small;
@@ -609,7 +640,7 @@ void build_corners(lv_obj_t *v, CornerReadouts &c, const char *next_text, Screen
     c.dba = seg7_create(v, small, "I88");
     seg7_set_colors(c.dba, kColText, ghost);
     seg7_set_text(c.dba, "i--");
-    lv_obj_align(c.dba, LV_ALIGN_BOTTOM_LEFT, 44, -66);
+    lv_obj_align(c.dba, LV_ALIGN_BOTTOM_LEFT, 44, -102);
     lv_obj_add_flag(c.dba, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(c.dba, 24);
     lv_obj_add_event_cb(c.dba, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
@@ -619,12 +650,9 @@ void build_corners(lv_obj_t *v, CornerReadouts &c, const char *next_text, Screen
     c.leq = seg7_create(v, small, "I88");
     seg7_set_colors(c.leq, kColText, ghost);
     seg7_set_text(c.leq, "i--");
-    lv_obj_align(c.leq, LV_ALIGN_BOTTOM_RIGHT, -44, -66);
+    lv_obj_align(c.leq, LV_ALIGN_BOTTOM_RIGHT, -44, -102);
     lv_obj_t *cap_r = make_label(v, &lv_font_montserrat_16, kColDim, "LAeq 15m");
     lv_obj_align_to(cap_r, c.leq, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 6);
-
-    lv_obj_t *btn = make_button(v, next_text, 128, 52, on_show_screen, (void *)(intptr_t)next);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -54);
 }
 
 void build_spectrum_view(lv_obj_t *scr)
@@ -632,12 +660,11 @@ void build_spectrum_view(lv_obj_t *scr)
     lv_obj_t *v = make_view(scr);
     ui.spec_view = v;
 
-    // 64 bars x 6 px = 384 px wide. Bars rise from y = 340, just above the
-    // corner readouts (their tops are at y = 358).
-    ui.spec = spectrum_view_create(v, 384, 300, kSpecBands);
-    lv_obj_align(ui.spec, LV_ALIGN_TOP_MID, 0, 40);
+    // 64 bars x 6 px = 384 px wide, rising from the bottom of the graph area.
+    ui.spec = spectrum_view_create(v, 384, kGraphH, kSpecBands);
+    lv_obj_align(ui.spec, LV_ALIGN_TOP_MID, 0, kGraphTop);
 
-    build_corners(v, ui.spec_corners, "History", Screen::History);
+    build_corners(v, ui.spec_corners);
 
     lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
     lv_timer_create(spec_timer_cb, kSpecFrameMs, nullptr);
@@ -650,10 +677,10 @@ void build_history_view(lv_obj_t *scr)
 
     // 40 px label column + 90 bars x 4 px = 400 px wide; same height and
     // baseline as the analyser.
-    ui.hist = history_view_create(v, 400, 300, kHistBars);
-    lv_obj_align(ui.hist, LV_ALIGN_TOP_MID, 0, 40);
+    ui.hist = history_view_create(v, 400, kGraphH, kHistBars);
+    lv_obj_align(ui.hist, LV_ALIGN_TOP_MID, 0, kGraphTop);
 
-    build_corners(v, ui.hist_corners, "Waterfall", Screen::Waterfall);
+    build_corners(v, ui.hist_corners);
 
     lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
 }
@@ -663,9 +690,8 @@ void build_waterfall_view(lv_obj_t *scr)
     lv_obj_t *v = make_view(scr);
     ui.wf_view = v;
 
-    // Same position and size as the analyser: 64 bands x 6 px = 384 px wide,
-    // 300 px tall, bottom edge just above the corner readouts.
-    constexpr int32_t kW = 384, kH = 300, kTop = 40;
+    // Same position and size as the analyser: 64 bands x 6 px = 384 px wide.
+    constexpr int32_t kW = 384, kH = kGraphH, kTop = kGraphTop;
     ui.wf = waterfall_view_create(v, kW, kH, kSpecBands, kWfRowPx);
     if (ui.wf) {
         lv_obj_align(ui.wf, LV_ALIGN_TOP_MID, 0, kTop);
@@ -685,9 +711,76 @@ void build_waterfall_view(lv_obj_t *scr)
         lv_obj_align(l, LV_ALIGN_TOP_LEFT, (BSP_LCD_H_RES - kW) / 2 + x - 25, kTop - 22);
     }
 
-    build_corners(v, ui.wf_corners, "dB meter", Screen::Meter);
+    build_corners(v, ui.wf_corners);
 
     lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
+}
+
+// PPM needle: 25 updates a second. The ballistics run at the audio rate in
+// the audio task, so sampling the reading here loses nothing.
+void ppm_timer_cb(lv_timer_t *)
+{
+    if (ui.screen != Screen::Ppm) return;
+    float ppm_dbfs;
+    {
+        std::lock_guard<std::mutex> lock(g_levels_mutex);
+        ppm_dbfs = g_levels.ppm;
+    }
+    const float d = g_audio_ok ? to_spl(ppm_dbfs) - kPpmAlignDb : -100.0f;
+    ppm_view_set(ui.ppm, slm::ppm_position(d));
+}
+
+void on_ppm_scale(lv_event_t *)
+{
+    const bool ebu = !ppm_view_is_ebu(ui.ppm);
+    ppm_view_set_ebu(ui.ppm, ebu);
+    lv_label_set_text(ui.ppm_scale, ebu ? "PPM  EBU" : "PPM  BBC");
+}
+
+// Same layout as the meter screen, with the PPM dial in place of the arc.
+void build_ppm_view(lv_obj_t *scr)
+{
+    lv_obj_t *v = make_view(scr);
+    ui.ppm_view = v;
+
+    ui.ppm = ppm_view_create(v, 440);
+    lv_obj_center(ui.ppm);
+
+    // Scale name between the "4" at the top of the dial and the reading;
+    // tap it to switch between BBC (1..7) and EBU (-12..+12) markings.
+    ui.ppm_scale = make_label(v, &lv_font_montserrat_16, kColDim, "PPM  BBC");
+    lv_obj_align(ui.ppm_scale, LV_ALIGN_CENTER, 0, -136);
+    lv_obj_add_flag(ui.ppm_scale, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ui.ppm_scale, 16);
+    lv_obj_add_event_cb(ui.ppm_scale, on_ppm_scale, LV_EVENT_CLICKED, nullptr);
+
+    slm::Seg7Geometry seg;  // same as the meter screen
+    ui.ppm_value = seg7_create(v, seg, "I88");
+    seg7_set_colors(ui.ppm_value, kColText, lv_color_hex(0x1C1C1C));
+    seg7_set_text(ui.ppm_value, "i--");
+    lv_obj_align(ui.ppm_value, LV_ALIGN_CENTER, 0, -60);
+    lv_obj_add_flag(ui.ppm_value, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ui.ppm_value, 30);
+    lv_obj_add_event_cb(ui.ppm_value, on_toggle_mode, LV_EVENT_CLICKED, nullptr);
+
+    ui.ppm_mode = make_label(v, &lv_font_montserrat_24, kColDim, ui.slow ? "dB(A)  SLOW" : "dB(A)  FAST");
+    lv_obj_align(ui.ppm_mode, LV_ALIGN_CENTER, 0, 12);
+
+    slm::Seg7Geometry leq_geo;  // same as the meter screen's LAeq
+    leq_geo.digit_w = 24;
+    leq_geo.digit_h = 44;
+    leq_geo.thick = 6;
+    leq_geo.gap = 1;
+    leq_geo.spacing = 7;
+    ui.ppm_leq = seg7_create(v, leq_geo, "I88");
+    seg7_set_colors(ui.ppm_leq, kColText, lv_color_hex(0x1C1C1C));
+    seg7_set_text(ui.ppm_leq, "i--");
+    lv_obj_align(ui.ppm_leq, LV_ALIGN_CENTER, 0, 60);
+    lv_obj_t *cap = make_label(v, &lv_font_montserrat_16, kColDim, "LAeq 15m");
+    lv_obj_align(cap, LV_ALIGN_CENTER, 0, 96);
+
+    lv_obj_add_flag(v, LV_OBJ_FLAG_HIDDEN);
+    lv_timer_create(ppm_timer_cb, kPpmFrameMs, nullptr);
 }
 
 void on_cal_open(lv_event_t *)
@@ -728,7 +821,7 @@ void build_cal_panel(lv_obj_t *scr)
     lv_obj_set_style_radius(p, 0, 0);
     lv_obj_remove_flag(p, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = make_label(p, &lv_font_montserrat_24, kColText, "Calibration");
+    lv_obj_t *title = make_label(p, &lv_font_montserrat_24, kColText, "Settings");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
 
     lv_obj_t *help = make_label(p, &lv_font_montserrat_16, kColDim,
@@ -771,7 +864,7 @@ void build_ui()
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     // Main (sound level meter) view: a transparent full-screen container, one
-    // of three (meter, analyser, history) that show_screen() switches between.
+    // of five that show_screen() switches between.
     lv_obj_t *mv = make_view(scr);
     ui.main_view = mv;
 
@@ -798,8 +891,7 @@ void build_ui()
     // Vertical layout, offsets from the screen centre (reading 100 px tall):
     //   OVERLOAD -150 (-162..-138) | reading -60 (-110..-10) | mode 12 (0..24)
     //   | LAeq digits 60 (38..82) | LAeq caption 96 (88..104)
-    //   | Analyser/Cal buttons 160 (134..186)
-    //   | battery icon at the bottom edge
+    //   | bottom bar: screen name, Mode and setup buttons, battery icon
     ui.over = make_label(mv, &lv_font_montserrat_24, kColRed, "OVERLOAD");
     lv_obj_align(ui.over, LV_ALIGN_CENTER, 0, -150);
     lv_obj_add_flag(ui.over, LV_OBJ_FLAG_HIDDEN);
@@ -833,14 +925,10 @@ void build_ui()
     lv_obj_t *leq_cap = make_label(mv, &lv_font_montserrat_16, kColDim, "LAeq 15m");
     lv_obj_align(leq_cap, LV_ALIGN_CENTER, 0, 96);
 
-    lv_obj_t *analyser = make_button(mv, "Analyser", 120, 52, on_show_screen, (void *)(intptr_t)Screen::Analyser);
-    lv_obj_align(analyser, LV_ALIGN_CENTER, -66, 160);
-    lv_obj_t *cal = make_button(mv, "Cal", 120, 52, on_cal_open, nullptr);
-    lv_obj_align(cal, LV_ALIGN_CENTER, 66, 160);
-
     build_spectrum_view(scr);
     build_history_view(scr);
     build_waterfall_view(scr);
+    build_ppm_view(scr);
 
     // Battery icon, bottom centre in the gap of the arc, dimmed to 33 %
     // (opacity over the black background = brightness).
@@ -849,6 +937,17 @@ void build_ui()
     // 84 / 255 = 33 %. Must be opa_layered: plain `opa` is only applied by
     // LVGL's built-in widgets, not by this icon's custom drawing.
     lv_obj_set_style_opa_layered(ui.battery, 84, 0);
+
+    // Bottom bar, the same on every screen (created after the views so it
+    // sits on top of them; the settings page covers it):
+    //   Mode (next screen) bottom left, screen name above the battery icon,
+    //   setup cog bottom right.
+    lv_obj_t *mode = make_button(scr, "Mode", 104, 52, on_mode, nullptr);
+    lv_obj_align(mode, LV_ALIGN_BOTTOM_LEFT, 20, -14);
+    ui.screen_name = make_label(scr, &lv_font_montserrat_20, kColDim, "dB Meter");
+    lv_obj_align(ui.screen_name, LV_ALIGN_BOTTOM_MID, 0, -48);
+    lv_obj_t *setup = make_button(scr, LV_SYMBOL_SETTINGS, 64, 52, on_cal_open, nullptr);
+    lv_obj_align(setup, LV_ALIGN_BOTTOM_RIGHT, -20, -14);
 
     build_cal_panel(scr);
 

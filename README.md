@@ -15,7 +15,8 @@ levels on the 480×480 AMOLED.
 | Mic 1 / Mic 2 | LAF of each capsule on its own. A large gap means one mic is blocked or faulty. |
 | OVERLOAD | Either mic hit ADC full scale in the last second, so the reading is not valid. |
 
-**Cal** opens a calibration page with ±0.1 and ±1 dB steps. The value is saved to NVS.
+The **cog** button (bottom right, on every screen) opens the settings page,
+which calibrates with ±0.1 and ±1 dB steps. The value is saved to NVS.
 
 ## How it works
 
@@ -71,18 +72,22 @@ Settings are under `idf.py menuconfig` → **Sound Level Meter**:
 |---|---|---|
 | `SLM_MIC_GAIN_DB` | 12 | ES7210 PGA gain. Lower it for very loud sources, raise it for quiet rooms. Calibration is stored relative to 0 dB gain, so you do not need to recalibrate after changing it. |
 | `SLM_CAL_OFFSET_X10` | 1350 | Default offset of 135.0 dB, used until you save a calibration on the device. |
+| `SLM_PPM_ALIGN_DB` | 64 | Steady level in dB SPL (unweighted) that reads PPM 4. Marks are 4 dB apart, so mark 6 is 72 dB and mark 7 is 76 dB. |
 
 ## Screens
 
-There are four screens. The button at the bottom centre (above the battery
-icon) moves to the next one in turn:
+There are five screens. Every screen has the same bottom bar:
 
-**dB meter** → **Analyser** → **History** → **Waterfall** → **dB meter**
+- **Mode** (bottom left) moves to the next screen in turn:
+  **dB Meter** → **Spectrum** → **History** → **Waterfall** → **PPM** → **dB Meter**
+- The current screen's name is shown at the bottom centre, above the
+  battery icon.
+- The **cog** (bottom right) opens the settings / calibration page.
 
-On the meter screen the button is **Analyser**, next to **Cal**. The other
-three screens all show the current dB(A) bottom left and LAeq 15m bottom
-right, on 7-segment readouts. Tap the dB(A) readout to switch between Fast
-and Slow; the setting is shared by all the screens.
+The spectrum, history and waterfall screens show the current dB(A) bottom
+left and LAeq 15m bottom right, on 7-segment readouts above the bottom bar;
+the PPM screen has the meter screen's layout. Tap a dB(A) reading to switch
+between Fast and Slow; the setting is shared by all the screens.
 
 ## Spectrum screen
 
@@ -121,15 +126,37 @@ A rolling bar graph of dB(A) over the last 15 minutes
 
 The spectrum over time ([main/waterfall_view.cpp](main/waterfall_view.cpp)).
 
-- Every 0.25 s a new line is drawn at the top and the older lines move down.
-  The screen holds 100 lines, so it shows the last 25 seconds.
+- Every 0.1 s a new 2 px line is drawn at the top and the older lines move
+  down. The screen holds 135 lines, so it shows the last 13.5 seconds.
 - Each line has the same 64 bands as the analyser (50 Hz on the left to
   13 kHz on the right, marked at 100, 1k and 10k) with the same
   calibration and level scale. Each line is the energy average of the FFT
-  frames in its quarter second.
+  frames in its 0.1 s.
 - Louder is brighter: black → blue → purple → red → yellow → white.
 - It starts empty each time you open the screen, because the FFT only runs
   while the analyser or waterfall is showing.
+
+## PPM screen
+
+Like the meter screen (large dB(A), smaller LAeq 15m), but the outer dial is
+a peak programme meter of the BBC / EBU type, IEC 60268-10 Type II
+([main/ppm.hpp](main/ppm.hpp), [main/ppm_view.cpp](main/ppm_view.cpp)).
+
+- **Scale:** white needle and marks on black. BBC marks 1–7 are 4 dB apart,
+  with 4 at the alignment level (`SLM_PPM_ALIGN_DB`, default 64 dB SPL).
+  Below 1 the scale is compressed down to the rest stop. The section above
+  6, the BBC maximum for programme peaks, is red. Tap **PPM BBC** under the
+  top of the dial to switch to EBU markings (−12 to +12 dB, TEST at 0) at
+  the same positions.
+- **Ballistics:** quasi-peak, measured on the unweighted signal (20 Hz
+  high-pass, 13 kHz interference low-pass). A 5 kHz tone burst reads 4.6 dB
+  below the steady tone for 10 ms, 8.3 dB below for 5 ms and 16.7 dB below
+  for 1.5 ms. The standard asks for 4, 9 and 17 dB. The needle falls 24 dB
+  in 2.8 s. A steady sine reads its RMS level to within 0.2 dB from 100 Hz
+  to 10 kHz.
+- The ballistics run at the full 48 kHz sample rate in the audio task. The
+  needle is redrawn 25 times a second, and only the area it covers is
+  redrawn.
 
 ## Auto-rotation
 
@@ -162,7 +189,7 @@ The default offset is only an estimate. It assumes a −38 dBV/Pa MEMS capsule.
 
 1. Put a 94 dB (1 kHz) acoustic calibrator over the mic ports, or place the
    board next to a reference sound level meter in a steady noise source.
-2. Tap **Cal**.
+2. Tap the **cog** button (bottom right).
 3. Use the step buttons until **Live LAS** matches the reference.
 4. Tap **Save**.
 

@@ -20,6 +20,7 @@
 #include "level_meter.hpp"
 #include "lowpass.hpp"
 #include "orientation.hpp"
+#include "ppm.hpp"
 #include "seg7_layout.hpp"
 #include "spectrum.hpp"
 
@@ -565,6 +566,73 @@ static int check_history()
     return fails;
 }
 
+// PPM (IEC 60268-10 Type II): 5 kHz tone bursts read 4, 9 and 17 dB below
+// the steady tone for 10, 5 and 1.5 ms; falls 24 dB in 2.8 s; a steady sine
+// reads its RMS level; marks map onto the dial.
+static int check_ppm()
+{
+    int fails = 0;
+    auto need = [&](const char *what, bool ok) {
+        if (!ok) { std::printf("ppm: FAIL %s\n", what); ++fails; }
+    };
+    const double fs = 48000;
+    // Highest reading for a tone burst of `ms` at frequency f, amplitude 0.5.
+    auto burst = [&](double f, double ms) {
+        slm::PpmMeter m(fs);
+        float top = -200;
+        const int on = int(ms / 1000 * fs);
+        for (int i = 0; i < int(fs); ++i) {
+            m.process(i < on ? float(0.5 * std::sin(2 * M_PI * f * i / fs)) : 0.0f);
+            if (m.reading_db() > top) top = m.reading_db();
+        }
+        return double(top);
+    };
+    const double rms_db = 20 * std::log10(0.5 / std::sqrt(2.0));
+    const double steady = burst(5000, 1000);
+    const double b10 = burst(5000, 10) - steady, b5 = burst(5000, 5) - steady, b15 = burst(5000, 1.5) - steady;
+    std::printf("ppm: 5 kHz bursts 10 ms %+.2f, 5 ms %+.2f, 1.5 ms %+.2f dB; steady 1 kHz reads %+.2f dB re RMS\n",
+                b10, b5, b15, burst(1000, 1000) - rms_db);
+    need("10 ms burst -4 +-0.75 dB", std::fabs(b10 + 4) <= 0.75);
+    need("5 ms burst -9 +-1 dB", std::fabs(b5 + 9) <= 1.0);
+    need("1.5 ms burst -17 +-2 dB", std::fabs(b15 + 17) <= 2.0);
+    need("steady 1 kHz sine reads its RMS (+-0.1 dB)", std::fabs(burst(1000, 1000) - rms_db) <= 0.1);
+    need("steady 5 kHz reads its RMS (+-0.2 dB)", std::fabs(steady - rms_db) <= 0.2);
+    for (double f : {100.0, 10000.0})
+        std::printf("ppm: steady %.0f Hz reads %+.2f dB re RMS\n", f, burst(f, 1000) - rms_db);
+
+    // Fall: from a steady tone to silence, 24 dB takes 2.8 s (+-0.3 s).
+    {
+        slm::PpmMeter m(fs);
+        for (int i = 0; i < int(fs); ++i) m.process(float(0.5 * std::sin(2 * M_PI * 1000 * i / fs)));
+        const float start = m.reading_db();
+        int n = 0;
+        while (m.reading_db() > start - 24 && n < int(10 * fs)) {
+            m.process(0.0f);
+            ++n;
+        }
+        const double t = n / fs;
+        std::printf("ppm: fall 24 dB in %.2f s\n", t);
+        need("fall 24 dB in 2.8 +-0.3 s", std::fabs(t - 2.8) <= 0.3);
+    }
+    // DC is ignored (20 Hz high-pass): DC plus a small tone reads the tone,
+    // once the switch-on step has fallen away.
+    {
+        slm::PpmMeter m(fs);
+        for (int i = 0; i < int(12 * fs); ++i) m.process(float(0.3 + 0.01 * std::sin(2 * M_PI * 1000 * i / fs)));
+        const double want = 20 * std::log10(0.01 / std::sqrt(2.0));
+        need("DC ignored", std::fabs(m.reading_db() - want) < 0.3);
+    }
+    // Dial: marks 4 dB apart, mark 4 at 0 dB, compressed below 1, stops at 0 and 8.
+    need("mark 4 at 0 dB", slm::ppm_position(0) == 4.0f);
+    need("mark 1 at -12 dB", slm::ppm_position(-12) == 1.0f);
+    need("mark 7 at +12 dB", slm::ppm_position(12) == 7.0f);
+    need("mark 6 at +8 dB", slm::ppm_position(8) == 6.0f);
+    need("rest stop", slm::ppm_position(-100) == 0.0f && slm::ppm_position(-24) == 0.0f);
+    need("end stop", slm::ppm_position(40) == 8.0f);
+    std::printf("ppm: %s\n", fails ? "FAILED" : "ok");
+    return fails;
+}
+
 int main()
 {
     int failures = 0;
@@ -572,6 +640,7 @@ int main()
     failures += check_spectrum();
     failures += check_rolling_leq();
     failures += check_history();
+    failures += check_ppm();
     failures += check_battery();
     failures += check_seg7(slm::Seg7Geometry{}, true);  // main reading (defaults)
     {

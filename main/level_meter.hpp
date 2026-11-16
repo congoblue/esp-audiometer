@@ -35,6 +35,7 @@
 
 #include "a_weighting.hpp"
 #include "lowpass.hpp"
+#include "ppm.hpp"
 
 namespace slm {
 
@@ -43,6 +44,7 @@ struct Levels {
     float lafmax = -200, lafmin = -200;
     float mic1 = -200, mic2 = -200;
     float leq_seconds = 0;  // time covered by laeq (up to the window length)
+    float ppm = -200;       // unweighted PPM reading (ppm.hpp), dBFS sine RMS
     bool clipping = false;
 };
 
@@ -51,7 +53,7 @@ public:
     static constexpr size_t kLeqWindowSeconds = 15 * 60;
 
     explicit LevelMeter(double fs)
-        : fs_(fs), wa_(fs), w1_(fs), w2_(fs), lp_(fs), lp1_(fs), lp2_(fs)
+        : fs_(fs), wa_(fs), w1_(fs), w2_(fs), lp_(fs), lp1_(fs), lp2_(fs), ppm_(fs)
     {
         alpha_fast_ = float(1.0 - std::exp(-1.0 / (fs * 0.125)));
         alpha_slow_ = float(1.0 - std::exp(-1.0 / (fs * 1.0)));
@@ -73,7 +75,9 @@ public:
 
             // Low-pass first (removes the board's ~14.8 kHz interference, see
             // lowpass.hpp), then A-weighting.
-            const float y = wa_.process(lp_.process(0.5f * (l + r)));
+            const float mix = lp_.process(0.5f * (l + r));
+            const float y = wa_.process(mix);
+            ppm_.process(mix);  // PPM is unweighted
             const float y1 = w1_.process(lp1_.process(l));
             const float y2 = w2_.process(lp2_.process(r));
             const float p = y * y;
@@ -135,6 +139,7 @@ public:
         if (max_ms_ > 0) s.lafmax = to_db(max_ms_);
         if (min_ms_ < kHuge) s.lafmin = to_db(min_ms_);
         s.clipping = clip_left_ > 0;
+        s.ppm = ppm_.reading_db();
         return s;
     }
 
@@ -171,6 +176,7 @@ private:
     double fs_;
     AWeighting wa_, w1_, w2_;
     ChebyLowpass lp_, lp1_, lp2_;  // interference low-pass, 14.5 kHz stopband
+    PpmMeter ppm_;
     float alpha_fast_, alpha_slow_;
     float fast_ = 0, slow_ = 0, m1_ = 0, m2_ = 0;
     float max_ms_ = 0, min_ms_ = kHuge;

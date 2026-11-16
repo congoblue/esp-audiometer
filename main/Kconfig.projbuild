@@ -20,6 +20,16 @@ menu "Sound Level Meter"
             against a reference meter or 94 dB calibrator using the on-screen
             Cal page, which saves the result to NVS and overrides this value.
 
+    config SLM_PPM_ALIGN_DB
+        int "PPM alignment level: dB SPL at mark 4 (EBU TEST)"
+        range 30 120
+        default 64
+        help
+            Steady sound (unweighted) that reads PPM 4. The marks are 4 dB
+            apart, so with the default 64 dB, mark 1 is 52 dB SPL, mark 6
+            (the BBC maximum for programme peaks) is 72 dB and mark 7 is
+            76 dB. Normal speech about 1 m away then peaks around 5 to 6.
+
     menu "Auto-rotation"
 
         config SLM_AUTO_ROTATE
